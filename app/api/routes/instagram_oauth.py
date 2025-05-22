@@ -396,4 +396,152 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
         print(f"Erro ao revogar acesso: {str(e)}")
         import traceback
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"Erro ao revogar acesso: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Erro ao revogar acesso: {str(e)}")
+
+@router.post("/publish")
+async def publish_to_instagram(
+    request: Request,
+    body: dict,
+    jwt_token: str = Header(None, alias="jwt_token")
+):
+    """
+    Publica um vídeo no Instagram usando a API Graph.
+    
+    Body:
+        username: Nome de usuário do Instagram
+        type: Tipo de post (reel, feed)
+        when: Tipo de agendamento (now, schedule)
+        schedule_date: Data de agendamento (opcional)
+        video_url: URL do vídeo
+        caption: Legenda do post
+        hashtags: Hashtags do post
+    """
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
+
+    # Validar campos obrigatórios
+    required_fields = ["username", "type", "when", "video_url", "caption"]
+    for field in required_fields:
+        if field not in body:
+            raise HTTPException(status_code=400, detail=f"Campo obrigatório ausente: {field}")
+
+    # Buscar sessão do Instagram
+    session = execute_query(
+        "SELECT * FROM instagram_sessions WHERE user_id = %s AND username = %s AND is_active = TRUE",
+        [user_id, body["username"]]
+    )
+
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sessão não encontrada para o usuário {body['username']}"
+        )
+
+    session_data = session[0]
+    access_token = session_data.get("session_data", {}).get("access_token")
+    instagram_account_id = session_data.get("session_data", {}).get("account_id")
+
+    if not access_token or not instagram_account_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Dados de sessão inválidos. Reconecte sua conta do Instagram."
+        )
+
+    try:
+        # Download do vídeo
+        print(f"[INSTAGRAM_API] Baixando vídeo: {body['video_url']}")
+        video_response = requests.get(body["video_url"], stream=True)
+        video_response.raise_for_status()
+
+        # Criar arquivo temporário
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+        video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
+
+        # Salvar vídeo
+        with open(video_path, 'wb') as f:
+            for chunk in video_response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        # Preparar caption com hashtags
+        caption = body["caption"]
+        if body.get("hashtags"):
+            caption = f"{caption}\n\n{body['hashtags']}"
+
+        # Iniciar upload do container
+        print("[INSTAGRAM_API] Iniciando upload do container")
+        container_url = f"https://graph.facebook.com/v18.0/{instagram_account_id}/media"
+        container_data = {
+            "media_type": "REELS" if body["type"].lower() == "reel" else "VIDEO",
+            "video_url": body["video_url"],
+            "caption": caption,
+            "access_token": access_token
+        }
+
+        # Se for agendado, adicionar timestamp
+        if body["when"] == "schedule" and body.get("schedule_date"):
+            try:
+                schedule_time = datetime.fromisoformat(body["schedule_date"].replace('Z', '+00:00'))
+                container_data["publishing_type"] = "SCHEDULED"
+                container_data["scheduled_publish_time"] = int(schedule_time.timestamp())
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=f"Data de agendamento inválida: {str(e)}")
+
+        container_response = requests.post(container_url, data=container_data)
+        container_response.raise_for_status()
+        container_id = container_response.json().get("id")
+
+        if not container_id:
+            raise HTTPException(status_code=500, detail="Falha ao criar container de mídia")
+
+        print(f"[INSTAGRAM_API] Container criado: {container_id}")
+
+        # Publicar o container
+        publish_url = f"https://graph.facebook.com/v18.0/{instagram_account_id}/media_publish"
+        publish_data = {
+            "creation_id": container_id,
+            "access_token": access_token
+        }
+
+        publish_response = requests.post(publish_url, data=publish_data)
+        publish_response.raise_for_status()
+        
+        # Limpar arquivo temporário
+        try:
+            os.remove(video_path)
+        except:
+            pass
+
+        return {
+            "status": "success",
+            "message": "Vídeo publicado com sucesso" if body["when"] == "now" else "Vídeo agendado com sucesso",
+            "post_id": publish_response.json().get("id")
+        }
+
+    except requests.RequestException as e:
+        error_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_data = e.response.json()
+                error_msg = error_data.get('error', {}).get('message', str(e))
+            except:
+                error_msg = e.response.text
+
+        print(f"[INSTAGRAM_API] Erro ao publicar: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Erro ao publicar no Instagram: {error_msg}")
+
+    except Exception as e:
+        print(f"[INSTAGRAM_API] Erro inesperado: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+    finally:
+        # Garantir que o arquivo temporário seja removido
+        try:
+            if 'video_path' in locals():
+                os.remove(video_path)
+        except:
+            pass 
