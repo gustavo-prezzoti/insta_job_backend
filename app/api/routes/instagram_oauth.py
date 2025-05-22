@@ -329,14 +329,15 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
     try:
         username = (body or {}).get("username") if body else None
         current_time = datetime.now(timezone.utc).isoformat()
+        revoked_usernames = []
         
         if username:
             # Revogar acesso apenas para a conta específica
-            print(f"Revogando acesso para {username} do usuário {user_id}")
+            instagram_logger.info(f"Revogando acesso para {username} do usuário {user_id}")
             
             # Verificar se a sessão existe para este usuário
             sessions = execute_query(
-                "SELECT * FROM instagram_sessions WHERE user_id = %s AND username = %s AND is_active = TRUE",
+                "SELECT * FROM instagram.instagram_sessions WHERE user_id = %s AND username = %s AND is_active = TRUE",
                 [user_id, username]
             )
             
@@ -346,28 +347,55 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
                     detail=f"Sessão ativa não encontrada para o usuário {username}"
                 )
             
-            # Desativar a sessão
+            session = sessions[0]
+            
+            # Tentar revogar no Instagram/Meta se tivermos os dados da sessão
+            try:
+                if session.get("session_data"):
+                    session_data = session["session_data"]
+                    if isinstance(session_data, str):
+                        session_data = json.loads(session_data)
+                    
+                    # Extrair token
+                    access_token = session_data.get("page_access_token") or session_data.get("access_token")
+                    if access_token:
+                        # Limpar o token
+                        access_token = access_token.strip().strip('"').strip("'")
+                        
+                        # Revogar no Instagram/Meta
+                        instagram_logger.info(f"Revogando token no Instagram/Meta para {username}")
+                        revoke_url = "https://graph.instagram.com/v18.0/instagram_oauth/revoke_access"
+                        revoke_params = {
+                            "access_token": access_token
+                        }
+                        revoke_response = requests.delete(revoke_url, params=revoke_params)
+                        instagram_logger.debug(f"Resposta da revogação no Instagram: {revoke_response.text}")
+                        
+                        # Também tentar desconectar app no Facebook
+                        app_id = os.environ.get("INSTAGRAM_APP_ID") or os.environ.get("FACEBOOK_APP_ID")
+                        if app_id:
+                            facebook_revoke_url = f"https://graph.facebook.com/v18.0/{app_id}/permissions"
+                            facebook_response = requests.delete(facebook_revoke_url, params=revoke_params)
+                            instagram_logger.debug(f"Resposta da revogação no Facebook: {facebook_response.text}")
+            except Exception as e:
+                instagram_logger.error(f"Erro ao revogar token no Instagram/Meta: {str(e)}")
+                # Continuar mesmo se falhar na revogação externa
+            
+            # Desativar a sessão no banco de dados
             execute_query(
-                "UPDATE instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND username = %s AND is_active = TRUE",
+                "UPDATE instagram.instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND username = %s AND is_active = TRUE",
                 [current_time, user_id, username],
                 fetch=False
             )
             
-            # Opcionalmente, também revogar no Facebook
-            # Isso exigiria o token de acesso salvo, que está na session_data
-            
-            return {
-                "status": "success",
-                "message": f"Acesso revogado para {username}",
-                "revoked_accounts": [username]
-            }
+            revoked_usernames = [username]
         else:
             # Revogar acesso para todas as contas do usuário
-            print(f"Revogando acesso para todas as contas do usuário {user_id}")
+            instagram_logger.info(f"Revogando acesso para todas as contas do usuário {user_id}")
             
             # Obter todas as sessões ativas
             active_sessions = execute_query(
-                "SELECT username FROM instagram_sessions WHERE user_id = %s AND is_active = TRUE",
+                "SELECT * FROM instagram.instagram_sessions WHERE user_id = %s AND is_active = TRUE",
                 [user_id]
             )
             
@@ -378,27 +406,62 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
                     "revoked_accounts": []
                 }
             
+            # Para cada sessão, tentar revogar no Instagram/Meta
+            for session in active_sessions:
+                username = session["username"]
+                revoked_usernames.append(username)
+                
+                # Tentar revogar no Instagram/Meta
+                try:
+                    if session.get("session_data"):
+                        session_data = session["session_data"]
+                        if isinstance(session_data, str):
+                            session_data = json.loads(session_data)
+                        
+                        # Extrair token
+                        access_token = session_data.get("page_access_token") or session_data.get("access_token")
+                        if access_token:
+                            # Limpar o token
+                            access_token = access_token.strip().strip('"').strip("'")
+                            
+                            # Revogar no Instagram/Meta
+                            instagram_logger.info(f"Revogando token no Instagram/Meta para {username}")
+                            revoke_url = "https://graph.instagram.com/v18.0/instagram_oauth/revoke_access"
+                            revoke_params = {
+                                "access_token": access_token
+                            }
+                            revoke_response = requests.delete(revoke_url, params=revoke_params)
+                            instagram_logger.debug(f"Resposta da revogação no Instagram: {revoke_response.text}")
+                            
+                            # Também tentar desconectar app no Facebook
+                            app_id = os.environ.get("INSTAGRAM_APP_ID") or os.environ.get("FACEBOOK_APP_ID")
+                            if app_id:
+                                facebook_revoke_url = f"https://graph.facebook.com/v18.0/{app_id}/permissions"
+                                facebook_response = requests.delete(facebook_revoke_url, params=revoke_params)
+                                instagram_logger.debug(f"Resposta da revogação no Facebook: {facebook_response.text}")
+                except Exception as e:
+                    instagram_logger.error(f"Erro ao revogar token no Instagram/Meta para {username}: {str(e)}")
+                    # Continuar para a próxima conta mesmo se falhar
+            
             # Desativar todas as sessões
             execute_query(
-                "UPDATE instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND is_active = TRUE",
+                "UPDATE instagram.instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND is_active = TRUE",
                 [current_time, user_id],
                 fetch=False
             )
-            
-            revoked_usernames = [session["username"] for session in active_sessions]
-            
-            return {
-                "status": "success",
-                "message": f"Acesso revogado para {len(revoked_usernames)} conta(s)",
-                "revoked_accounts": revoked_usernames
-            }
+        
+        return {
+            "status": "success",
+            "message": f"Acesso revogado para {len(revoked_usernames)} conta(s)",
+            "revoked_accounts": revoked_usernames
+        }
     
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Erro ao revogar acesso: {str(e)}")
+        instagram_logger.error(f"Erro ao revogar acesso: {str(e)}")
         import traceback
-        print(traceback.format_exc())
+        instagram_logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Erro ao revogar acesso: {str(e)}")
 
 @router.post("/publish")
