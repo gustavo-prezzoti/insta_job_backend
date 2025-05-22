@@ -7,7 +7,7 @@ from app.services.instagram import (
 )
 # Import the new publish function from instagram_graph
 from app.services.instagram_graph import publish_to_instagram as graph_publish_to_instagram
-from app.services.auth import get_user_from_db
+from app.services.auth import get_user_from_db, get_current_user
 from app.core.security import verify_jwt, get_user_id_from_token
 from instagrapi import Client
 from app.utils.proxy import get_user_proxy_url
@@ -20,7 +20,7 @@ from typing import Optional
 router = APIRouter(prefix="/instagram", tags=["Instagram"])
 
 @router.get("/check-credentials")
-def check_instagram_credentials(jwt_token: str = Header(...)):
+def check_instagram_credentials(request: Request, jwt_token: str = Header(None, alias="jwt_token")):
     """
     Verificar credenciais do Instagram:
       - Recebe apenas o JWT token
@@ -28,11 +28,11 @@ def check_instagram_credentials(jwt_token: str = Header(...)):
       - Busca se existem sessões ativas do Instagram para o usuário
       - Retorna informações sobre as sessões encontradas
     """
-    # Verificar JWT
-    user_id = get_user_id_from_token(jwt_token)
+    # Verificar JWT usando a nova forma que aceita também Authorization: Bearer
+    user_id = get_user_id_from_token(request, jwt_token)
 
     # Verificar se usuário existe e está ativo
-    user = get_user_from_db(user_id)
+    user = get_current_user(request, jwt_token)
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
 
@@ -245,37 +245,38 @@ async def connect_instagram_ws(websocket: WebSocket):
         cl.set_proxy(None)  # Reset proxy
 
 @router.post("/post")
-def post_instagram(request: PostRequest, jwt_token: str = Header(...)):
+def post_instagram(request: Request, request_data: PostRequest, jwt_token: str = Header(None, alias="jwt_token")):
     """
-    Postar no Instagram:
-      - Recebe JWT e body com {username, type, when, schedule_date, video_url, caption, hashtags}.
-      - Verifica JWT, usuário e existência de sessão ativa.
-      - Se when='now', publica imediatamente.
-      - Se when='schedule', agenda para postagem futura.
+    Publica conteúdo no Instagram:
+      - Recebe informações da postagem no body
+      - Valida o JWT e verifica se a sessão do Instagram existe
+      - Publica o conteúdo no Instagram
+      - Retorna detalhes da postagem
     """
-    user_id = get_user_id_from_token(jwt_token)
-
-    user = get_user_from_db(user_id)
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
 
     # Procurar sessão ativa do usuário
-    resp = get_instagram_session(user_id, request.username)
+    resp = get_instagram_session(user_id, request_data.username)
     if not resp:
         raise HTTPException(status_code=404, detail="Sessão ativa não encontrada")
     sessao = resp
 
     print(f"Sessão ID: {sessao['id']}")
-    print(f"Request type: {request.type}, quando: {request.when}")
+    print(f"Request type: {request_data.type}, quando: {request_data.when}")
 
-    if request.when == "schedule":
+    if request_data.when == "schedule":
         # Verificar se o usuário tem uma assinatura ativa
         if not user.get("current_plan_start_date"):
             raise HTTPException(status_code=403, detail="Usuário não possui assinatura ativa")
 
         # Verificar se a data agendada está dentro do período da assinatura
         if user.get("current_plan_end_date"):
-            schedule_date_obj = datetime.fromisoformat(request.schedule_date)
+            schedule_date_obj = datetime.fromisoformat(request_data.schedule_date)
             subscription_end_date = datetime.fromisoformat(user["current_plan_end_date"])
 
             if schedule_date_obj.date() > subscription_end_date.date():
@@ -288,12 +289,12 @@ def post_instagram(request: PostRequest, jwt_token: str = Header(...)):
         from app.services.scheduled_posts import schedule_post
         return schedule_post(
             user_id=user_id,
-            username=request.username,
-            post_type=request.type,
-            schedule_date=request.schedule_date,
-            video_url=request.video_url,
-            caption=request.caption,
-            hashtags=request.hashtags
+            username=request_data.username,
+            post_type=request_data.type,
+            schedule_date=request_data.schedule_date,
+            video_url=request_data.video_url,
+            caption=request_data.caption,
+            hashtags=request_data.hashtags
         )
 
     # Caso contrário, publicar imediatamente usando a Graph API
@@ -307,12 +308,12 @@ def post_instagram(request: PostRequest, jwt_token: str = Header(...)):
             # Usar o novo serviço de publicação com Graph API
             result = graph_publish_to_instagram(
                 session_data=session_data,
-                post_type=request.type,
-                video_url=request.video_url,
-                caption=request.caption,
-                hashtags=request.hashtags,
+                post_type=request_data.type,
+                video_url=request_data.video_url,
+                caption=request_data.caption,
+                hashtags=request_data.hashtags,
                 user_id=user_id,
-                username=request.username,
+                username=request_data.username,
                 schedule_type="now",
                 session_id=sessao['id']
             )
@@ -322,12 +323,12 @@ def post_instagram(request: PostRequest, jwt_token: str = Header(...)):
             print("AVISO: Usando método deprecated de publicação com instagrapi.")
             result = publish_to_instagram(
                 session_data=session_data,
-                post_type=request.type,
-                video_url=request.video_url,
-                caption=request.caption,
-                hashtags=request.hashtags,
+                post_type=request_data.type,
+                video_url=request_data.video_url,
+                caption=request_data.caption,
+                hashtags=request_data.hashtags,
                 user_id=user_id,
-                username=request.username,
+                username=request_data.username,
                 schedule_type="now",
                 session_id=sessao['id']
             )
@@ -338,29 +339,27 @@ def post_instagram(request: PostRequest, jwt_token: str = Header(...)):
         raise HTTPException(status_code=400, detail=f"Erro ao postar: {e}")
 
 @router.post("/disconnect")
-def disconnect_instagram(request: DisconnectRequest, jwt_token: str = Header(...)):
+def disconnect_instagram(request: Request, request_data: DisconnectRequest, jwt_token: str = Header(None, alias="jwt_token")):
     """
-    Desconectar do Instagram:
-      - Recebe JWT (no header) e body com {username}.
-      - Verifica validade do JWT, existência/atividade do usuário no banco.
-      - Busca a sessão do Instagram associada ao usuário e username.
-      - Marca a sessão como inativa.
-      - Retorna confirmação de desconexão.
+    Desconecta uma conta do Instagram:
+      - Recebe apenas o username no body
+      - Valida o JWT e verifica se a sessão do Instagram existe
+      - Desativa a sessão no banco de dados
+      - Retorna confirmação da desconexão
     """
-    # Verificar JWT e obter user_id
-    user_id = get_user_id_from_token(jwt_token)
-
-    # Verificar se usuário existe e está ativo
-    user = get_user_from_db(user_id)
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
     if not user:
-        raise HTTPException(status_code=400, detail="Usuário não encontrado ou inativo")
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
 
     # Buscar sessão ativa do Instagram para o usuário e username
-    session = get_instagram_session(user_id, request.username)
+    session = get_instagram_session(user_id, request_data.username)
     if not session:
         raise HTTPException(
             status_code=400,
-            detail=f"Sessão para o usuário Instagram '{request.username}' não encontrada"
+            detail=f"Sessão para o usuário Instagram '{request_data.username}' não encontrada"
         )
 
     try:
@@ -375,8 +374,8 @@ def disconnect_instagram(request: DisconnectRequest, jwt_token: str = Header(...
 
         return {
             "status": "success",
-            "message": f"Conta do Instagram '{request.username}' desconectada com sucesso",
-            "username": request.username
+            "message": f"Conta do Instagram '{request_data.username}' desconectada com sucesso",
+            "username": request_data.username
         }
     except Exception as e:
         print(f"Erro ao desconectar Instagram: {str(e)}")
@@ -387,6 +386,7 @@ def disconnect_instagram(request: DisconnectRequest, jwt_token: str = Header(...
 
 @router.post("/publish")
 async def publish_to_instagram(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     username: str = Form(...),
@@ -395,29 +395,18 @@ async def publish_to_instagram(
     caption: str = Form(""),
     hashtags: str = Form(""),
     schedule_date: Optional[str] = Form(None),  # Required if when=schedule
-    jwt_token: str = Header(...)
+    jwt_token: str = Header(None, alias="jwt_token")
 ):
     """
-    Endpoint unificado para publicar conteúdo no Instagram.
-    Aceita o upload de vídeo e todos os metadados da postagem em um único pedido.
-    Suporta publicação imediata ou agendada.
-    
-    Args:
-        file: Arquivo de vídeo
-        username: Nome de usuário do Instagram
-        post_type: Tipo de postagem (feed, reel, story)
-        when: Quando publicar (now, schedule)
-        caption: Legenda da postagem
-        hashtags: Hashtags para a postagem
-        schedule_date: Data de agendamento (ISO format, ex: "2023-06-01T10:00:00Z")
-        jwt_token: Token JWT do usuário
-        
-    Returns:
-        Status da operação e detalhes
+    Endpoint para upload e publicação de mídia no Instagram:
+      - Recebe arquivo, tipo de post e outros detalhes via Form
+      - Valida JWT e verifica sessão do Instagram
+      - Salva o arquivo temporariamente e publica no Instagram
+      - Retorna detalhes da publicação
     """
     # Verificar JWT
-    user_id = get_user_id_from_token(jwt_token)
-    user = get_user_from_db(user_id)
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
     
     if not user:
         raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
