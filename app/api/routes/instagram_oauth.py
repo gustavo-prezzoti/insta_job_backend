@@ -1794,48 +1794,6 @@ def convert_video_for_instagram(input_path, output_dir=None, is_tiktok=False):
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
             instagram_logger.info(f"Vídeo convertido com sucesso: {output_path} ({output_size_mb:.2f} MB)")
-            
-            # Verificar se o tamanho está dentro dos limites do Instagram (8MB para garantia)
-            if output_size_mb > 7.5:
-                instagram_logger.warning(f"Vídeo convertido muito grande ({output_size_mb:.2f} MB). Tentando compressão adicional...")
-                
-                # Compressão adicional para reduzir tamanho
-                compressed_output = os.path.join(output_dir, f"compressed_{random_id}.mp4")
-                
-                compress_command = [
-                    ffmpeg_path,
-                    "-i", output_path,
-                    "-c:v", "libx264",
-                    "-profile:v", "baseline",
-                    "-preset", "veryslow",    # Usar veryslow para máxima compressão
-                    "-crf", "30",             # Aumentar CRF para reduzir tamanho
-                    "-maxrate", "1500k",      # Reduzir bitrate máximo
-                    "-bufsize", "2000k",      # Reduzir buffer
-                    "-vf", "scale=720:-2",    # Garantir escala fixa
-                    "-c:a", "aac",
-                    "-b:a", "96k",           # Reduzir bitrate de áudio
-                    "-ac", "1",              # Mono para economizar espaço
-                    "-movflags", "+faststart",
-                    "-y",
-                    compressed_output
-                ]
-                
-                compress_process = subprocess.Popen(
-                    compress_command, 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True
-                )
-                
-                compress_stdout, compress_stderr = compress_process.communicate()
-                
-                if compress_process.returncode == 0 and os.path.exists(compressed_output) and os.path.getsize(compressed_output) > 0:
-                    final_size_mb = os.path.getsize(compressed_output) / (1024 * 1024)
-                    instagram_logger.info(f"Compressão adicional bem-sucedida: {compressed_output} ({final_size_mb:.2f} MB)")
-                    
-                    # Usar o arquivo comprimido em vez do original
-                    return compressed_output
-            
             return output_path
         else:
             instagram_logger.error("Arquivo de saída não existe ou está vazio")
