@@ -391,8 +391,8 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
             
             # Desativar a sessão no banco de dados
             execute_query(
-                "UPDATE instagram.instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND username = %s AND is_active = TRUE",
-                [current_time, user_id, username],
+                "DELETE FROM instagram.instagram_sessions WHERE user_id = %s AND username = %s",
+                [user_id, username],
                 fetch=False
             )
             
@@ -461,8 +461,8 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
             
             # Desativar todas as sessões
             execute_query(
-                "UPDATE instagram.instagram_sessions SET is_active = FALSE, status = 'revoked', updated_at = %s WHERE user_id = %s AND is_active = TRUE",
-                [current_time, user_id],
+                "DELETE FROM instagram.instagram_sessions WHERE user_id = %s",
+                [user_id],
                 fetch=False
             )
         
@@ -581,15 +581,12 @@ async def publish_to_instagram(
                 instagram_logger.info(f"Revogando sessão para {body['username']}")
                 execute_query(
                     """
-                    UPDATE instagram.instagram_sessions 
-                    SET is_active = FALSE, 
-                        status = 'revoked', 
-                        updated_at = %s 
+                    DELETE FROM instagram.instagram_sessions 
                     WHERE user_id = %s 
                     AND username = %s 
                     AND is_active = TRUE
                     """,
-                    [current_time, user_id, body["username"]],
+                    [user_id, body["username"]],
                     fetch=False
                 )
                 instagram_logger.info(f"Sessão revogada com sucesso para {body['username']}")
@@ -862,16 +859,12 @@ async def revoke_invalid_session(
         # Desativar a sessão
         execute_query(
             """
-            UPDATE instagram.instagram_sessions 
-            SET is_active = FALSE, 
-                status = 'revoked', 
-                updated_at = %s 
+            DELETE FROM instagram.instagram_sessions 
             WHERE user_id = %s 
             AND username = %s 
             AND is_active = TRUE
-            RETURNING id
             """,
-            [current_time, user_id, username],
+            [user_id, username],
             fetch=False
         )
 
@@ -882,4 +875,39 @@ async def revoke_invalid_session(
 
     except Exception as e:
         print(f"Erro ao revogar sessão: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao revogar sessão: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Erro ao revogar sessão: {str(e)}")
+
+@router.post("/cleanup")
+async def cleanup_instagram_sessions(
+    request: Request,
+    jwt_token: str = Header(None, alias="jwt_token")
+):
+    """
+    Remove todas as sessões revogadas ou inativas do Instagram para o usuário.
+    Útil para limpar o banco de dados de sessões antigas.
+    """
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
+    
+    try:
+        # Remover todas as sessões inativas do usuário
+        result = execute_query(
+            "DELETE FROM instagram.instagram_sessions WHERE user_id = %s AND (is_active = FALSE OR status = 'revoked') RETURNING username",
+            [user_id]
+        )
+        
+        removed_count = len(result) if result else 0
+        removed_usernames = [row["username"] for row in result] if result else []
+        
+        return {
+            "status": "success",
+            "message": f"Removidas {removed_count} sessões antigas ou revogadas",
+            "removed_sessions": removed_usernames
+        }
+    except Exception as e:
+        instagram_logger.error(f"Erro ao limpar sessões: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao limpar sessões: {str(e)}") 

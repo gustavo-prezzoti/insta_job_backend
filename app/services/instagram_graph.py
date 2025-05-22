@@ -288,12 +288,12 @@ def create_instagram_session(user_id: int, account_data: Dict[str, Any], token_d
 
         if existing_session:
             # Update existing session
-            print(f"[INSTAGRAM_API] Sessão para {username} já existe, atualizando...")
+            print(f"[INSTAGRAM_API] Sessão para {username} já existe, removendo sessões antigas...")
             
-            # Desativar todas as sessões existentes para este usuário+username
+            # Remover (não apenas desativar) todas as sessões existentes para este usuário+username
             execute_query(
-                "UPDATE instagram_sessions SET is_active = FALSE, updated_at = %s WHERE user_id = %s AND username = %s",
-                [current_time, user_id, username],
+                "DELETE FROM instagram_sessions WHERE user_id = %s AND username = %s",
+                [user_id, username],
                 fetch=False
             )
             
