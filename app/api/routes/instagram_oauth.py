@@ -692,59 +692,72 @@ async def publish_to_instagram(
 
             instagram_logger.info(f"Container criado com sucesso: {container_id}")
 
-            # Aguardar o processamento do vídeo
-            instagram_logger.info("Aguardando processamento do vídeo...")
-            max_attempts = 40  # Aumentado para 40 tentativas (2 minutos no total)
-            attempt = 0
+            # Verificar status do container antes de tentar publicar
+            instagram_logger.info("Verificando status do container antes de publicar...")
             status_url = f"https://graph.instagram.com/v18.0/{container_id}"
+            status_params = {"access_token": access_token, "fields": "status_code"}
+            
+            # Aguardar que o container esteja pronto para publicação
+            # De acordo com a documentação, deve-se verificar no máximo 1x por minuto por até 5 minutos
+            max_attempts = 10
+            attempt = 0
+            container_ready = False
             
             while attempt < max_attempts:
                 attempt += 1
                 instagram_logger.debug(f"Verificando status do container (tentativa {attempt}/{max_attempts})")
                 
                 try:
-                    status_params = {"access_token": access_token, "fields": "status_code,status"}
                     status_response = requests.get(status_url, params=status_params)
                     instagram_logger.debug(f"Resposta do status: {status_response.text}")
                     
                     if status_response.status_code == 200:
                         status_data = status_response.json()
-                        status_code = status_data.get("status_code")
+                        status_code = status_data.get("status_code", "")
                         
                         if status_code == "FINISHED":
-                            instagram_logger.info("Vídeo processado com sucesso")
+                            instagram_logger.info("Container pronto para publicação")
+                            container_ready = True
                             break
+                        elif status_code == "PUBLISHED":
+                            instagram_logger.info("Container já foi publicado")
+                            container_ready = True
+                            break
+                        elif status_code == "ERROR" or status_code == "EXPIRED":
+                            error_msg = f"Erro no processamento do container: {status_code}"
+                            instagram_logger.error(error_msg)
+                            raise HTTPException(status_code=400, detail=error_msg)
                         elif status_code == "IN_PROGRESS":
-                            instagram_logger.debug("Vídeo ainda em processamento...")
-                        elif status_code in ["ERROR", "EXPIRED"]:
-                            instagram_logger.error(f"Erro no processamento do vídeo: {status_data}")
-                            raise HTTPException(
-                                status_code=400,
-                                detail="Erro no processamento do vídeo. Por favor, tente novamente."
-                            )
+                            instagram_logger.debug("Container ainda em processamento...")
                         else:
                             instagram_logger.warning(f"Status desconhecido: {status_code}")
                     else:
                         instagram_logger.warning(f"Erro ao verificar status (HTTP {status_response.status_code})")
                     
-                    # Ajustar o tempo de espera baseado na tentativa
-                    if attempt < 10:  # Primeiros 30 segundos
-                        time.sleep(3)
-                    elif attempt < 20:  # Próximos 30 segundos
-                        time.sleep(5)
-                    else:  # Resto do tempo
-                        time.sleep(7)
+                    # Aguardar antes da próxima verificação
+                    time.sleep(6)  # Aguardar 6 segundos (máximo de 10 verificações em 1 minuto)
                     
                 except Exception as e:
                     instagram_logger.error(f"Erro ao verificar status: {str(e)}")
-                    time.sleep(3)  # Esperar mesmo em caso de erro
+                    time.sleep(6)
             
-            if attempt >= max_attempts:
-                instagram_logger.error("Timeout aguardando processamento do vídeo")
+            if not container_ready:
+                instagram_logger.error("Timeout aguardando processamento do container")
                 raise HTTPException(
                     status_code=408,
                     detail="O vídeo está demorando muito para processar. Por favor, tente novamente com um vídeo menor ou aguarde alguns minutos."
                 )
+
+            # Tentar publicar
+            instagram_logger.info("Iniciando publicação do vídeo")
+            publish_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media_publish"
+            publish_data = {
+                "creation_id": container_id,
+                "access_token": access_token
+            }
+
+            instagram_logger.debug(f"URL de publicação: {publish_url}")
+            instagram_logger.debug(f"Dados de publicação: {json.dumps(publish_data)}")
 
             # Tentar publicar algumas vezes
             max_publish_attempts = 3
@@ -757,15 +770,6 @@ async def publish_to_instagram(
 
                 try:
                     # Publicar o container
-                    publish_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media_publish"
-                    publish_data = {
-                        "creation_id": container_id,
-                        "access_token": access_token
-                    }
-
-                    instagram_logger.debug(f"URL de publicação: {publish_url}")
-                    instagram_logger.debug(f"Dados de publicação: {json.dumps(publish_data)}")
-
                     publish_response = requests.post(publish_url, data=publish_data)
                     instagram_logger.debug(f"Resposta da publicação: {publish_response.text}")
                     
