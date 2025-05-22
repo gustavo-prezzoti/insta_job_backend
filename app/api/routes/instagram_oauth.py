@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Header, HTTPException, Request, Depends, Response
 from fastapi.responses import RedirectResponse, PlainTextResponse
 import os
+import requests
 from datetime import datetime, timezone
 
 from app.core.security import get_user_id_from_token, get_current_user
@@ -19,6 +20,32 @@ router = APIRouter(prefix="/instagram/oauth", tags=["Instagram OAuth"])
 
 # Define a constant for verification or use the one from config
 INSTAGRAM_VERIFY_TOKEN = "meatyhamhock"  # You should replace this with your actual verify token
+
+def get_instagram_user_info(access_token: str) -> dict:
+    """
+    Get Instagram user information using the access token.
+    
+    Args:
+        access_token: Instagram access token
+        
+    Returns:
+        Dictionary with user information including username
+    """
+    try:
+        # Make request to Instagram API to get user info
+        url = "https://graph.instagram.com/me"
+        params = {
+            "fields": "id,username",
+            "access_token": access_token
+        }
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as e:
+        print(f"[INSTAGRAM_OAUTH] Error getting user info: {str(e)}")
+        if hasattr(e, 'response') and e.response:
+            print(f"[INSTAGRAM_OAUTH] Response content: {e.response.text}")
+        raise HTTPException(status_code=400, detail=f"Failed to get user info: {str(e)}")
 
 @router.post("/auth", response_model=InstagramAuthResponse)
 def authorize_instagram(request: InstagramAuthRequest, req: Request, jwt_token: str = Header(None, alias="jwt_token")):
@@ -157,15 +184,22 @@ async def complete_oauth(request: Request, jwt_token: str = Header(None, alias="
             raise HTTPException(status_code=400, detail="Formato de token inesperado na resposta do Instagram")
             
         # Usar o token para obter contas do Instagram
-        # A resposta do Instagram Basic API tem formato diferente do Graph API
         access_token = token_data["access_token"]
-        user_id_instagram = token_data.get("user_id")
+        
+        # Get user info including username
+        user_info = get_instagram_user_info(access_token)
+        user_id_instagram = user_info.get("id")
+        username = user_info.get("username")
+        
+        if not username:
+            print(f"[INSTAGRAM_OAUTH] ERRO: Não foi possível obter o username do Instagram")
+            raise HTTPException(status_code=400, detail="Não foi possível obter o username do Instagram")
             
         print(f"[INSTAGRAM_OAUTH] Buscando contas do Instagram usando token...")
         # Como é o endpoint básico do Instagram, devemos usar apenas uma conta - a do usuário que autorizou
         instagram_accounts = [{
             "id": user_id_instagram,
-            "username": token_data.get("username", "instagram_user"),
+            "username": username,
             "page_id": user_id_instagram,  # Usar o mesmo ID como page_id (simplificação)
             "page_access_token": access_token
         }]
