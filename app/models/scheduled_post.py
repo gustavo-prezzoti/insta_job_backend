@@ -1,5 +1,13 @@
 from pydantic import BaseModel
 from typing import Optional
+from enum import Enum
+
+class ScheduledPostStatus(str, Enum):
+    """Status enum for scheduled posts"""
+    PENDING = "pendente"
+    PROCESSING = "processing"
+    PUBLISHED = "published"
+    ERROR = "error"
 
 class ScheduledPostResponse(BaseModel):
     id: int

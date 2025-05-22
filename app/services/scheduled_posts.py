@@ -98,7 +98,7 @@ def schedule_post(user_id: int, username: str, post_type: str, schedule_date: st
         """
         params = (
             user_id, caption, hashtags, schedule_date, post_type, video_url, 
-            "pendente", current_time, current_time, username
+            ScheduledPostStatus.PENDING.value, current_time, current_time, username
         )
         
         result = execute_query(query, params)
@@ -275,9 +275,9 @@ def cron_posting():
     SELECT * FROM instagram_scheduled_posts
     WHERE schedule_for <= %s
     AND schedule_for >= %s
-    AND status = 'pendente'
+    AND status = %s
     """
-    params = (now.isoformat(), ten_minutes_ago.isoformat())
+    params = (now.isoformat(), ten_minutes_ago.isoformat(), ScheduledPostStatus.PENDING.value)
     
     posts = execute_query(query, params)
 
@@ -287,11 +287,11 @@ def cron_posting():
         placeholders = ", ".join(["%s"] * len(post_ids))
         
         # Adicionar updated_at ao final dos parâmetros
-        params = post_ids + [datetime.now(timezone.utc).isoformat()]
+        params = post_ids + [ScheduledPostStatus.PROCESSING.value, datetime.now(timezone.utc).isoformat()]
         
         query = f"""
         UPDATE instagram_scheduled_posts
-        SET status = 'processing', updated_at = %s
+        SET status = %s, updated_at = %s
         WHERE id IN ({placeholders})
         """
         
@@ -317,7 +317,7 @@ def process_post(post):
         
         if not session:
             print(f"[CRON] Sessão não encontrada para {post['username']}")
-            update_post_status(post["id"], "error", "Sessão do Instagram não encontrada")
+            update_post_status(post["id"], ScheduledPostStatus.ERROR.value, "Sessão do Instagram não encontrada")
             return
         
         # Check account type to determine which publish method to use
@@ -353,13 +353,13 @@ def process_post(post):
             )
         
         # Update post status to published
-        update_post_status(post["id"], "published", "Publicado com sucesso")
+        update_post_status(post["id"], ScheduledPostStatus.PUBLISHED.value, "Publicado com sucesso")
         print(f"[CRON] Post {post['id']} publicado com sucesso")
         
     except Exception as e:
         error_message = str(e)
         print(f"[CRON] Erro ao processar post {post['id']}: {error_message}")
-        update_post_status(post["id"], "error", error_message[:255])  # Limit error message length
+        update_post_status(post["id"], ScheduledPostStatus.ERROR.value, error_message[:255])  # Limit error message length
 
 def update_post_status(post_id, status, message=None):
     """
