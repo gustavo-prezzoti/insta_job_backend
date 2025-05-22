@@ -5,6 +5,11 @@ import requests
 from datetime import datetime, timezone
 import json
 import time
+import subprocess
+import shutil
+import uuid
+import boto3
+from botocore.exceptions import NoCredentialsError, ClientError
 
 from app.core.security import get_user_id_from_token, get_current_user
 from app.models.instagram_graph import InstagramAuthRequest, InstagramAuthResponse
@@ -480,6 +485,96 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
         instagram_logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Erro ao revogar acesso: {str(e)}")
 
+def interpret_instagram_error(error_data):
+    """
+    Interpreta códigos de erro da API do Instagram e retorna mensagens mais amigáveis.
+    
+    Args:
+        error_data: Dados de erro da API do Instagram
+        
+    Returns:
+        Mensagem de erro interpretada
+    """
+    if not error_data or not isinstance(error_data, dict):
+        return "Erro desconhecido da API do Instagram"
+    
+    # Garantir que temos a estrutura correta de erro
+    if 'error' not in error_data:
+        return str(error_data)
+    
+    error = error_data.get('error', {})
+    code = error.get('code')
+    subcode = error.get('error_subcode')
+    message = error.get('message', '')
+    user_title = error.get('error_user_title', '')
+    user_msg = error.get('error_user_msg', '')
+    
+    # Logar todos os detalhes do erro para diagnóstico
+    import logging
+    logging.getLogger('instagram_logger').debug(f"Erro completo: Código {code}, Subcódigo {subcode}, Mensagem: {message}, Título: {user_title}, Msg: {user_msg}")
+    
+    # Usar a mensagem específica para o usuário se disponível
+    if user_msg:
+        return f"{user_title}: {user_msg}"
+    
+    # Mensagens específicas baseadas nos códigos de erro
+    error_map = {
+        # Códigos principais
+        -2: "Tempo limite excedido ou mídia expirada",
+        -1: "Erro do servidor do Instagram",
+        1: "Restrição de atividade para proteger a comunidade",
+        4: "Ação considerada spam",
+        9: "Limite diário de publicações atingido (máximo 50 em 24h)",
+        24: "Mídia não encontrada ou token expirado",
+        25: "Conta do Instagram restrita",
+        100: "Parâmetro inválido ou problema com marcações/carrossel",
+        352: "Formato de vídeo não suportado (use MP4 ou MOV)",
+        9004: "Não foi possível obter a mídia do URI fornecido",
+        9007: "Mídia não está pronta para publicação",
+        36000: "Imagem/vídeo muito grande (máximo 8MB)",
+        36001: "Formato de imagem não suportado (use JPEG)",
+        36003: "Proporção da imagem inválida (use entre 4:5 e 1,91:1)",
+        36004: "Legenda muito longa (máximo 2.200 caracteres)",
+        
+        # Subcódigos mais comuns
+        2207001: "Erro do servidor do Instagram. Tente novamente.",
+        2207003: "Download da mídia atingiu o tempo limite. Tente novamente.",
+        2207004: "Imagem/vídeo muito grande (deve ser menor que 8MB).",
+        2207005: "Formato de imagem não suportado. Use apenas JPEG.",
+        2207006: "Mídia não encontrada (possível erro de permissão).",
+        2207008: "Container expirado. Crie um novo.",
+        2207009: "Proporção de imagem inválida (use entre 4:5 e 1,91:1).",
+        2207010: "Legenda muito longa (máximo 2.200 caracteres).",
+        2207020: "Mídia expirada. Tente fazer upload novamente.",
+        2207023: "Tipo de mídia desconhecido.",
+        2207026: "Formato de vídeo não suportado. Use MP4 ou MOV (MPEG-4 Part 14). O Instagram não aceita outros formatos de vídeo.",
+        2207027: "Mídia não está pronta para publicação. Aguarde.",
+        2207028: "Carrossel precisa ter entre 2 e 10 fotos/vídeos.",
+        2207032: "Falha ao criar mídia. Tente novamente.",
+        2207042: "Limite diário de publicações atingido (máximo 50 em 24h).",
+        2207050: "Conta do Instagram restrita.",
+        2207051: "Ação considerada spam pela proteção da comunidade.",
+        2207052: "Não foi possível obter mídia do URI fornecido.",
+        2207053: "Erro desconhecido no upload. Tente novamente.",
+        2207057: "Deslocamento da miniatura do vídeo inválido.",
+        2207067: "Tipo de mídia VIDEO foi descontinuado. Use REELS para publicar vídeos."
+    }
+    
+    # Verificar subcódigo primeiro (mais específico)
+    if subcode and subcode in error_map:
+        return f"{error_map[subcode]} (Código {code}, Subcódigo {subcode})"
+    
+    # Verificar código principal
+    if code and code in error_map:
+        return f"{error_map[code]} (Código {code})"
+    
+    # Retornar mensagem original e códigos se não encontrar correspondência
+    if code or subcode:
+        return f"{message} (Código {code}, Subcódigo {subcode})"
+    
+    # Fallback para mensagem original
+    return message or "Erro desconhecido da API do Instagram"
+
 @router.post("/publish")
 async def publish_to_instagram(
     request: Request,
@@ -601,19 +696,106 @@ async def publish_to_instagram(
         try:
             # Download do vídeo
             instagram_logger.info(f"Baixando vídeo: {body['video_url']}")
-            video_response = requests.get(body["video_url"], stream=True)
-            video_response.raise_for_status()
-
-            # Criar arquivo temporário
-            import tempfile
-            temp_dir = tempfile.gettempdir()
-            video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
-
-            # Salvar vídeo
-            with open(video_path, 'wb') as f:
-                for chunk in video_response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
+            try:
+                # Verificar se é URL do TikTok
+                is_tiktok = "tiktok" in body["video_url"].lower()
+                if is_tiktok:
+                    instagram_logger.info("Detectada URL do TikTok, usando tratamento especial")
+                
+                # Verificar se a URL é acessível
+                head_response = requests.head(body["video_url"], allow_redirects=True, timeout=10)
+                head_response.raise_for_status()
+                
+                # Verificar o tipo de conteúdo
+                content_type = head_response.headers.get('Content-Type', '')
+                instagram_logger.debug(f"Tipo de conteúdo do vídeo: {content_type}")
+                
+                if not content_type.startswith('video/'):
+                    instagram_logger.warning(f"URL pode não ser um vídeo direto. Content-Type: {content_type}")
+                
+                # Tentar obter o tamanho do vídeo
+                content_length = head_response.headers.get('Content-Length')
+                if content_length:
+                    size_mb = int(content_length) / (1024 * 1024)
+                    instagram_logger.debug(f"Tamanho do vídeo: {size_mb:.2f} MB")
+                    
+                    # Stories têm limite de tamanho
+                    if body["type"].lower() == "story" and size_mb > 15:
+                        instagram_logger.warning(f"Vídeo pode ser muito grande para story: {size_mb:.2f} MB (limite ~15MB)")
+                
+                # Baixar o vídeo com streaming
+                video_response = requests.get(body["video_url"], stream=True, timeout=30)
+                video_response.raise_for_status()
+                
+                # Criar arquivo temporário
+                import tempfile
+                temp_dir = tempfile.gettempdir()
+                video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
+                
+                # Salvar vídeo
+                with open(video_path, 'wb') as f:
+                    for chunk in video_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verificar se o arquivo foi criado corretamente
+                if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                    instagram_logger.error("Arquivo de vídeo vazio ou não criado")
+                    raise HTTPException(status_code=400, detail="Erro ao baixar vídeo - arquivo inválido")
+                
+                video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                instagram_logger.debug(f"Vídeo baixado para: {video_path} ({video_size_mb:.2f} MB)")
+                
+                # Converter o vídeo para formato compatível com Instagram usando FFmpeg
+                instagram_logger.info("Convertendo vídeo para formato compatível com Instagram...")
+                try:
+                    # Criar diretório temporário para vídeos convertidos
+                    temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted")
+                    os.makedirs(temp_converted_dir, exist_ok=True)
+                    
+                    # Converter o vídeo
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
+                    
+                    if converted_video_path and os.path.exists(converted_video_path):
+                        instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
+                        
+                        # Substituir o caminho do vídeo original pelo convertido
+                        video_path = converted_video_path
+                        
+                        # Fazer upload do vídeo convertido para o S3
+                        instagram_logger.info("Enviando vídeo convertido para o S3...")
+                        s3_video_url = upload_to_s3(video_path)
+                        
+                        if s3_video_url:
+                            instagram_logger.info(f"Vídeo enviado com sucesso para o S3: {s3_video_url}")
+                            # Substituir a URL original pelo link do S3
+                            body["video_url"] = s3_video_url
+                        else:
+                            instagram_logger.warning("Falha ao enviar vídeo para S3, usando URL original")
+                        
+                        # Atualizar informações de tamanho
+                        video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                        instagram_logger.debug(f"Vídeo convertido: {video_path} ({video_size_mb:.2f} MB)")
+                    else:
+                        instagram_logger.warning("Conversão de vídeo falhou, continuando com o vídeo original")
+                except Exception as conv_err:
+                    instagram_logger.error(f"Erro na conversão do vídeo: {str(conv_err)}")
+                    instagram_logger.warning("Continuando com o vídeo original sem conversão")
+                
+                # Para TikTok, tentar fazer upload direto para o Instagram
+                if is_tiktok and body["type"].lower() == "story":
+                    instagram_logger.info("Para vídeos de TikTok, usando URL direta em vez de download")
+                    # Continuar usando a URL direta neste caso
+                
+            except requests.RequestException as e:
+                instagram_logger.error(f"Erro ao baixar vídeo: {str(e)}")
+                if hasattr(e, 'response') and e.response:
+                    instagram_logger.error(f"Status: {e.response.status_code}, Resposta: {e.response.text[:200]}")
+                raise HTTPException(status_code=400, detail=f"Erro ao baixar vídeo: {str(e)}")
+                
+            except Exception as e:
+                instagram_logger.error(f"Erro inesperado ao baixar vídeo: {str(e)}")
+                raise HTTPException(status_code=400, detail=f"Erro ao processar vídeo: {str(e)}")
 
             # Preparar caption com hashtags
             caption = body["caption"]
@@ -635,16 +817,16 @@ async def publish_to_instagram(
             instagram_logger.info(f"Iniciando upload de {body['type'].lower()}")
             
             # Definir tipo de mídia e endpoint correto baseado no tipo de post
-            container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
-            
-            # Configurar dados do container conforme documentação oficial
             if body["type"].lower() == "story":
+                # Para stories, usar STORIES conforme documentação oficial
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
-                    "media_type": "STORIES",  # Tipo específico para stories
+                    "media_type": "STORIES",  # Tipo correto para stories
                     "video_url": body["video_url"],
                     "access_token": access_token
                 }
             elif body["type"].lower() == "reel":
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
                     "media_type": "REELS",  # Tipo específico para reels
                     "video_url": body["video_url"],
@@ -652,12 +834,29 @@ async def publish_to_instagram(
                     "access_token": access_token
                 }
             else:  # feed
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
-                    "media_type": "VIDEO",  # Tipo para vídeos no feed
+                    "media_type": "REELS",  # Usar REELS para vídeos de feed (conforme erro anterior)
                     "video_url": body["video_url"],
                     "caption": caption,
                     "access_token": access_token
                 }
+
+            # Postar com arquivo anexado
+            try:
+                container_response = requests.post(container_url, data=container_data)
+                instagram_logger.debug(f"Resposta com upload direto: {container_response.text}")
+            except Exception as upload_err:
+                instagram_logger.error(f"Erro no upload direto: {str(upload_err)}")
+                
+                # Fallback para URL se o upload direto falhar
+                instagram_logger.info("Fallback para método de URL após falha no upload direto")
+                container_data = {
+                    "media_type": "STORIES",  # Tipo correto para stories
+                    "video_url": body["video_url"],
+                    "access_token": access_token
+                }
+                container_response = requests.post(container_url, data=container_data)
 
             # Se for agendado, adicionar timestamp
             if body["when"] == "schedule" and body.get("schedule_date"):
@@ -672,15 +871,47 @@ async def publish_to_instagram(
             instagram_logger.debug(f"URL do container: {container_url}")
             instagram_logger.debug(f"Dados do container: {json.dumps(container_data)}")
 
-            container_response = requests.post(container_url, data=container_data)
-            instagram_logger.debug(f"Resposta da criação do container: {container_response.text}")
+            # Se não estiver usando o upload direto de arquivo, verifica a resposta aqui
+            if 'container_response' not in locals() or container_response is None:
+                container_response = requests.post(container_url, data=container_data)
+                instagram_logger.debug(f"Resposta da criação do container: {container_response.text}")
             
             if container_response.status_code != 200:
                 instagram_logger.error(f"Erro na criação do container: {container_response.text}")
                 error_data = container_response.json()
-                error_message = error_data.get('error', {}).get('message', 'Erro desconhecido')
-                raise HTTPException(status_code=400, detail=f"Erro ao criar container de mídia: {error_message}")
                 
+                # Extrair e logar códigos de erro específicos
+                if "error" in error_data:
+                    error_code = error_data["error"].get("code")
+                    error_subcode = error_data["error"].get("error_subcode")
+                    instagram_logger.error(f"Erro na criação do container - Código: {error_code}, Subcódigo: {error_subcode}")
+                    
+                    # Tratamento específico para erro de formato de vídeo
+                    if error_code == 352 or (error_subcode and error_subcode == 2207026):
+                        instagram_logger.error("Erro de formato de vídeo detectado")
+                        format_error_msg = """
+Formato de vídeo não suportado pelo Instagram. A conversão automática não resolveu o problema.
+Por favor, tente:
+
+1. Usar apenas vídeos no formato MP4 ou MOV (MPEG-4 Part 14)
+2. Verificar se a duração do vídeo está dentro dos limites permitidos:
+   - Para Stories: entre 3 e 60 segundos
+   - Para Reels: entre 3 segundos e 90 segundos
+3. Garantir que o tamanho do arquivo é menor que 100MB
+4. Usar codecs de vídeo H.264 ou H.265
+
+Para vídeos do TikTok, é recomendado baixar o vídeo e convertê-lo com um software como o VLC antes de fazer upload.
+"""
+                        raise HTTPException(status_code=400, detail=format_error_msg)
+                
+                friendly_error = interpret_instagram_error(error_data)
+                
+                # Para vídeos do TikTok, adicionar sugestão específica
+                if "tiktok" in body["video_url"].lower():
+                    friendly_error += " Para vídeos do TikTok, tente baixar o vídeo localmente primeiro e depois fazer upload."
+                
+                raise HTTPException(status_code=400, detail=f"Erro ao criar container de mídia: {friendly_error}")
+            
             container_response.raise_for_status()
             
             # Para stories, o processo agora é o mesmo dos vídeos normais,
@@ -724,22 +955,145 @@ async def publish_to_instagram(
                             container_ready = True
                             break
                         elif status_code == "ERROR" or status_code == "EXPIRED":
-                            error_msg = f"Erro no processamento do container: {status_code}"
+                            # Tentar obter mais detalhes sobre o erro
+                            error_details = ""
+                            error_data = {}
+                            try:
+                                # Primeiro, tentar obter mais detalhes com o endpoint padrão
+                                error_detail_url = f"https://graph.instagram.com/v18.0/{container_id}"
+                                error_detail_params = {
+                                    "access_token": access_token,
+                                    "fields": "status_code,status,error"  # Adicionar o campo error
+                                }
+                                error_detail_response = requests.get(error_detail_url, params=error_detail_params)
+                                instagram_logger.debug(f"Detalhes do erro (1): {error_detail_response.text}")
+                                
+                                if error_detail_response.status_code == 200:
+                                    error_details = error_detail_response.text
+                                    response_json = error_detail_response.json()
+                                    
+                                    # Verificar se temos o objeto error
+                                    if "error" in response_json:
+                                        error_data = response_json
+                                        instagram_logger.debug(f"Encontrado objeto 'error' nos detalhes")
+                                
+                                # Se não conseguimos o objeto error, tentar fazer uma chamada que provavelmente falhará
+                                # para obter uma resposta de erro completa
+                                if not error_data.get("error"):
+                                    instagram_logger.debug("Tentando obter detalhes do erro com chamada secundária")
+                                    
+                                    # Tentar publicar o container incorreto para forçar um erro detalhado
+                                    invalid_publish_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media_publish"
+                                    invalid_publish_params = {
+                                        "creation_id": container_id,
+                                        "access_token": access_token
+                                    }
+                                    
+                                    try:
+                                        error_response = requests.post(invalid_publish_url, data=invalid_publish_params)
+                                        if error_response.status_code != 200 and "error" in error_response.json():
+                                            error_data = error_response.json()
+                                            instagram_logger.debug(f"Detalhes do erro (2): {error_response.text}")
+                                    except Exception as pub_error:
+                                        instagram_logger.error(f"Erro ao tentar obter detalhes secundários: {str(pub_error)}")
+                                        
+                            except Exception as detail_err:
+                                instagram_logger.error(f"Erro ao obter detalhes: {str(detail_err)}")
+                            
+                            # Interpretar o erro
+                            friendly_error = ""
+                            if error_data and "error" in error_data:
+                                instagram_logger.debug(f"Código de erro encontrado: {error_data['error'].get('code')}, Subcódigo: {error_data['error'].get('error_subcode')}")
+                                friendly_error = interpret_instagram_error(error_data)
+                            else:
+                                # Códigos de status conhecidos
+                                status_errors = {
+                                    "ERROR": "Erro ao processar o vídeo. Verifique o formato e tamanho.",
+                                    "EXPIRED": "O container expirou. Tente novamente.",
+                                    "IN_PROGRESS": "O vídeo ainda está em processamento.",
+                                    "PUBLISHED": "O vídeo já foi publicado.",
+                                    "SCHEDULED": "O vídeo está agendado para publicação."
+                                }
+                                friendly_error = status_errors.get(status_code, f"Erro no processamento do container: {status_code}")
+                                
+                            error_msg = f"{friendly_error} Detalhes: {error_details}"
                             instagram_logger.error(error_msg)
-                            raise HTTPException(status_code=400, detail=error_msg)
+
+                            # Para stories, tentar abordagem alternativa com REELS
+                            if body["type"].lower() == "story" and attempt == 1:
+                                instagram_logger.info("Tentando abordagem alternativa para story usando REELS...")
+                                
+                                # Criar novo container com tipo REELS para story
+                                alt_container_data = {
+                                    "media_type": "REELS",
+                                    "video_url": body["video_url"],
+                                    "caption": caption if caption else "Story",
+                                    "access_token": access_token
+                                }
+                                
+                                try:
+                                    alt_container_response = requests.post(container_url, data=alt_container_data)
+                                    instagram_logger.debug(f"Resposta da criação alternativa: {alt_container_response.text}")
+                                    
+                                    if alt_container_response.status_code == 200:
+                                        container_id = alt_container_response.json().get("id")
+                                        if container_id:
+                                            instagram_logger.info(f"Container alternativo criado: {container_id}")
+                                            continue  # Voltar para a verificação com o novo container
+                                except Exception as alt_err:
+                                    instagram_logger.error(f"Erro na criação alternativa: {str(alt_err)}")
+                            
+                            # Se tiver problemas com vídeos do TikTok, sugerir alternativa
+                            if "tiktok" in body["video_url"].lower():
+                                instagram_logger.warning("Vídeo do TikTok detectado - pode haver incompatibilidade")
+                                sugestao = " Para vídeos do TikTok, tente baixar o vídeo localmente e depois fazer upload, ou use uma URL de vídeo de outra plataforma."
+                            
+                            # Sugestões com base no erro
+                            sugestao = ""
+                            if "muito grande" in error_msg.lower():
+                                sugestao = " Tente com um vídeo menor (menos de 8MB)."
+                            elif "formato" in error_msg.lower():
+                                sugestao = " Tente com um vídeo no formato MP4."
+                            elif "proporção" in error_msg.lower():
+                                sugestao = " Tente com um vídeo em formato vertical (9:16) para stories."
+                            
+                            # Se não for story ou a abordagem alternativa falhar
+                            raise HTTPException(status_code=400, detail=f"{friendly_error}{sugestao}")
                         elif status_code == "IN_PROGRESS":
                             instagram_logger.debug("Container ainda em processamento...")
                         else:
                             instagram_logger.warning(f"Status desconhecido: {status_code}")
                     else:
                         instagram_logger.warning(f"Erro ao verificar status (HTTP {status_response.status_code})")
+                        
+                        # Verificar se é um erro de limite de requisições
+                        try:
+                            error_data = status_response.json()
+                            if "error" in error_data:
+                                error_code = error_data["error"].get("code")
+                                error_subcode = error_data["error"].get("error_subcode")
+                                
+                                # Códigos relacionados a limite de requisições
+                                if error_code == 4 and error_subcode == 1349210:
+                                    instagram_logger.warning("Limite de requisições da API atingido, aguardando mais tempo")
+                                    time.sleep(10)  # Aguardar mais tempo antes da próxima tentativa
+                                    continue
+                                
+                                # Logar o erro para diagnóstico
+                                instagram_logger.error(f"Erro na verificação - Código: {error_code}, Subcódigo: {error_subcode}")
+                                instagram_logger.error(f"Mensagem de erro: {error_data['error'].get('message')}")
+                        except Exception as parse_err:
+                            instagram_logger.error(f"Erro ao parsear resposta de erro: {str(parse_err)}")
                     
-                    # Aguardar antes da próxima verificação
-                    time.sleep(6)  # Aguardar 6 segundos (máximo de 10 verificações em 1 minuto)
+                    # Ajustar o tempo de espera baseado na tentativa
+                    if attempt < 3:
+                        time.sleep(60)  # Primeiras tentativas, aguardar 6 segundos
+                    else:
+                        time.sleep(60)  # Tentativas posteriores, aguardar mais tempo
                     
                 except Exception as e:
                     instagram_logger.error(f"Erro ao verificar status: {str(e)}")
-                    time.sleep(6)
+                    time.sleep(10)  # Em caso de erro, aguardar mais tempo
             
             if not container_ready:
                 instagram_logger.error("Timeout aguardando processamento do container")
@@ -763,6 +1117,8 @@ async def publish_to_instagram(
             max_publish_attempts = 3
             publish_attempt = 0
             publish_success = False
+            publish_response = None
+            last_error = None
 
             while publish_attempt < max_publish_attempts and not publish_success:
                 publish_attempt += 1
@@ -779,23 +1135,76 @@ async def publish_to_instagram(
                     else:
                         error_data = publish_response.json()
                         error_message = error_data.get('error', {}).get('message', 'Erro desconhecido')
+                        friendly_error = interpret_instagram_error(error_data)
+                        last_error = friendly_error
+                        
+                        instagram_logger.error(f"Erro de publicação: {error_message}")
+                        instagram_logger.error(f"Erro interpretado: {friendly_error}")
                         
                         if "Media ID is not available" in error_message:
                             instagram_logger.warning("Mídia ainda não disponível, aguardando mais...")
                             time.sleep(5)  # Esperar mais 5 segundos antes da próxima tentativa
                         else:
+                            # Para stories que falham, tentar converter o tipo
+                            if body["type"].lower() == "story" and publish_attempt == 1:
+                                instagram_logger.info("Tentando opção alternativa para story...")
+                                
+                                # Tentar criar novo container com REELS como alternativa
+                                alt_container_data = {
+                                    "media_type": "REELS",  # Tentar com REELS como alternativa
+                                    "video_url": body["video_url"],
+                                    "caption": caption if caption else "",
+                                    "access_token": access_token
+                                }
+                                
+                                try:
+                                    alt_container_response = requests.post(
+                                        f"https://graph.instagram.com/v18.0/{instagram_user_id}/media", 
+                                        data=alt_container_data
+                                    )
+                                    
+                                    instagram_logger.debug(f"Resposta da criação alternativa (REELS): {alt_container_response.text}")
+                                    
+                                    if alt_container_response.status_code == 200:
+                                        alt_container_id = alt_container_response.json().get("id")
+                                        if alt_container_id:
+                                            instagram_logger.info(f"Container alternativo (REELS) criado: {alt_container_id}")
+                                            # Atualizar ID para tentar novamente
+                                            publish_data["creation_id"] = alt_container_id
+                                            # Não incrementar a contagem de tentativas
+                                            publish_attempt -= 1
+                                            # Aguardar um pouco para o container ser processado
+                                            time.sleep(5)
+                                            continue
+                                except Exception as alt_err:
+                                    instagram_logger.error(f"Erro na criação alternativa: {str(alt_err)}")
+
                             raise HTTPException(status_code=400, detail=f"Erro ao publicar: {error_message}")
                 
                 except Exception as e:
                     instagram_logger.error(f"Erro na tentativa de publicação {publish_attempt}: {str(e)}")
+                    last_error = str(e)
                     if publish_attempt == max_publish_attempts:
                         raise HTTPException(status_code=400, detail=f"Erro ao publicar: {str(e)}")
                     time.sleep(5)
 
             if not publish_success:
+                instagram_logger.error(f"Todas as tentativas de publicação falharam. Último erro: {last_error}")
+                
+                # Sugerir solução com base no erro
+                sugestao = ""
+                if "muito grande" in last_error.lower():
+                    sugestao = " Tente com um vídeo menor (menos de 8MB)."
+                elif "formato" in last_error.lower():
+                    sugestao = " Tente com um vídeo no formato MP4."
+                elif "limite" in last_error.lower():
+                    sugestao = " Tente novamente amanhã quando o limite diário for reiniciado."
+                elif "proporção" in last_error.lower():
+                    sugestao = " Tente com um vídeo em formato vertical (9:16) para stories."
+                
                 raise HTTPException(
                     status_code=400,
-                    detail="Não foi possível publicar o vídeo após várias tentativas. Por favor, tente novamente."
+                    detail=f"Não foi possível publicar o vídeo: {last_error}{sugestao}"
                 )
 
             # Limpar arquivo temporário
@@ -837,8 +1246,22 @@ async def publish_to_instagram(
             try:
                 if 'video_path' in locals():
                     os.remove(video_path)
-            except:
-                pass
+                    instagram_logger.debug(f"Arquivo temporário removido: {video_path}")
+                
+                # Limpar diretório de arquivos convertidos
+                temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted") if 'video_path' in locals() else None
+                if temp_converted_dir and os.path.exists(temp_converted_dir):
+                    instagram_logger.debug(f"Limpando diretório temporário: {temp_converted_dir}")
+                    try:
+                        for temp_file in os.listdir(temp_converted_dir):
+                            file_path = os.path.join(temp_converted_dir, temp_file)
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                        os.rmdir(temp_converted_dir)
+                    except Exception as cleanup_err:
+                        instagram_logger.warning(f"Erro ao limpar diretório temporário: {str(cleanup_err)}")
+            except Exception as e:
+                instagram_logger.warning(f"Erro ao remover arquivos temporários: {str(e)}")
 
     except requests.RequestException as e:
         error_msg = str(e)
@@ -860,8 +1283,99 @@ async def publish_to_instagram(
         try:
             if 'video_path' in locals():
                 os.remove(video_path)
-        except:
-            pass
+                instagram_logger.debug(f"Arquivo temporário removido: {video_path}")
+            
+            # Limpar diretório de arquivos convertidos
+            temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted") if 'video_path' in locals() else None
+            if temp_converted_dir and os.path.exists(temp_converted_dir):
+                instagram_logger.debug(f"Limpando diretório temporário: {temp_converted_dir}")
+                try:
+                    for temp_file in os.listdir(temp_converted_dir):
+                        file_path = os.path.join(temp_converted_dir, temp_file)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                    os.rmdir(temp_converted_dir)
+                except Exception as cleanup_err:
+                    instagram_logger.warning(f"Erro ao limpar diretório temporário: {str(cleanup_err)}")
+        except Exception as e:
+            instagram_logger.warning(f"Erro ao remover arquivos temporários: {str(e)}")
+
+@router.post("/check-video")
+async def check_video_url(
+    request: Request,
+    body: dict,
+    jwt_token: str = Header(None, alias="jwt_token")
+):
+    """
+    Verifica se uma URL de vídeo é adequada para publicação no Instagram.
+    Útil para diagnosticar problemas antes de tentar publicar.
+    """
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
+    
+    # Validar campos obrigatórios
+    if "video_url" not in body:
+        raise HTTPException(status_code=400, detail="URL do vídeo é obrigatória")
+    
+    video_url = body["video_url"]
+    result = {"url": video_url, "diagnostics": {}}
+    
+    try:
+        # Verificar cabeçalhos
+        head_response = requests.head(video_url, allow_redirects=True, timeout=10)
+        result["status_code"] = head_response.status_code
+        result["diagnostics"]["headers"] = dict(head_response.headers)
+        
+        # Verificar tipo de conteúdo
+        content_type = head_response.headers.get('Content-Type', '')
+        result["content_type"] = content_type
+        result["is_video"] = content_type.startswith('video/')
+        
+        # Verificar tamanho
+        content_length = head_response.headers.get('Content-Length')
+        if content_length:
+            size_bytes = int(content_length)
+            size_mb = size_bytes / (1024 * 1024)
+            result["size_bytes"] = size_bytes
+            result["size_mb"] = round(size_mb, 2)
+            
+            # Adicionar recomendações
+            result["recommendations"] = []
+            if size_mb > 100:
+                result["recommendations"].append("Vídeo muito grande, considere compressão")
+            if size_mb > 15 and not result["is_video"]:
+                result["recommendations"].append("Tamanho grande demais para story")
+        
+        # Baixar alguns bytes para verificar se é realmente um vídeo
+        with requests.get(video_url, stream=True, timeout=5) as r:
+            r.raise_for_status()
+            # Ler os primeiros 20 bytes para identificação
+            first_bytes = next(r.iter_content(20), b'')
+            result["first_bytes_hex"] = first_bytes.hex()
+            
+            # Verificar assinatura de formato de vídeo comum
+            is_mp4 = b'ftyp' in first_bytes
+            result["likely_mp4"] = is_mp4
+            
+            if not is_mp4 and not result["is_video"]:
+                result["recommendations"].append("Arquivo não parece ser um vídeo MP4 válido")
+        
+        return {
+            "status": "success",
+            "message": "Diagnóstico de vídeo concluído",
+            "result": result
+        }
+        
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"Erro ao verificar vídeo: {str(e)}",
+            "url": video_url
+        }
 
 @router.post("/revoke-invalid")
 async def revoke_invalid_session(
@@ -940,4 +1454,1060 @@ async def cleanup_instagram_sessions(
         }
     except Exception as e:
         instagram_logger.error(f"Erro ao limpar sessões: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Erro ao limpar sessões: {str(e)}") 
+        raise HTTPException(status_code=500, detail=f"Erro ao limpar sessões: {str(e)}")
+
+@router.get("/publishing-limit")
+async def check_publishing_limit(
+    request: Request,
+    username: str,
+    jwt_token: str = Header(None, alias="jwt_token")
+):
+    """
+    Verifica o limite atual de publicações do Instagram.
+    O Instagram limita a 50 publicações por dia (em período móvel de 24h).
+    """
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
+    
+    # Buscar sessão do Instagram
+    instagram_logger.info(f"Buscando sessão para usuário {user_id} e conta {username}")
+    session = execute_query(
+        """
+        SELECT * FROM instagram.instagram_sessions 
+        WHERE user_id = %s AND username = %s AND is_active = TRUE
+        """,
+        [user_id, username]
+    )
+    
+    if not session:
+        raise HTTPException(status_code=404, detail=f"Sessão não encontrada para o usuário {username}")
+    
+    session_data = session[0]
+    
+    try:
+        # Converter session_data de string para dict se necessário
+        if isinstance(session_data["session_data"], str):
+            session_data_dict = json.loads(session_data["session_data"])
+        else:
+            session_data_dict = session_data["session_data"]
+        
+        # Extrair o token de acesso
+        access_token = session_data_dict.get("page_access_token") or session_data_dict.get("access_token")
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Token de acesso não encontrado na sessão")
+        
+        # Limpar o token
+        access_token = access_token.strip().strip('"').strip("'")
+        
+        # Obter ID da conta Instagram
+        instagram_account_id = session_data_dict.get("account_id") or session_data_dict.get("id")
+        if not instagram_account_id:
+            raise HTTPException(status_code=400, detail="ID da conta Instagram não encontrado na sessão")
+        
+        # Consultar o limite de publicação
+        limit_url = f"https://graph.instagram.com/v18.0/{instagram_account_id}/content_publishing_limit"
+        limit_params = {
+            "access_token": access_token,
+            "fields": "config,quota_usage"
+        }
+        
+        instagram_logger.debug(f"Consultando limite de publicação para {username}")
+        limit_response = requests.get(limit_url, params=limit_params)
+        
+        if limit_response.status_code != 200:
+            error_data = limit_response.json()
+            friendly_error = interpret_instagram_error(error_data)
+            raise HTTPException(status_code=400, detail=f"Erro ao verificar limite: {friendly_error}")
+        
+        # Processar resposta
+        limit_data = limit_response.json()
+        instagram_logger.debug(f"Resposta do limite: {json.dumps(limit_data)}")
+        
+        # Formatar resultados
+        config = limit_data.get("config", {})
+        quota_usage = limit_data.get("quota_usage", 0)
+        
+        result = {
+            "username": username,
+            "publicacoes_restantes": config.get("quota_total", 50) - quota_usage,
+            "publicacoes_usadas": quota_usage,
+            "limite_total": config.get("quota_total", 50),
+            "intervalo_atualizacao": config.get("quota_usage_window", {"hours": 24}),
+            "dados_brutos": limit_data
+        }
+        
+        return {
+            "status": "success",
+            "message": f"Limite de publicação para {username}",
+            "data": result
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        instagram_logger.error(f"Erro ao verificar limite de publicação: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro ao verificar limite de publicação: {str(e)}")
+
+def convert_video_for_instagram(input_path, output_dir=None):
+    """
+    Converte um vídeo para um formato compatível com o Instagram (MP4 com codec H.264).
+    
+    Args:
+        input_path: Caminho do vídeo original
+        output_dir: Diretório para salvar o vídeo convertido (opcional)
+        
+    Returns:
+        Path do vídeo convertido ou None se falhar
+    """
+    instagram_logger.info(f"Iniciando conversão do vídeo: {input_path}")
+    
+    # Verificar se o vídeo existe
+    if not os.path.exists(input_path):
+        instagram_logger.error(f"Arquivo de vídeo não encontrado: {input_path}")
+        return None
+    
+    # Criar diretório temporário para saída se não fornecido
+    if not output_dir:
+        output_dir = os.path.join(os.path.dirname(input_path), "instagram_converted")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Gerar nome de arquivo único para saída
+    random_id = uuid.uuid4().hex[:8]
+    output_filename = f"instagram_compatible_{random_id}.mp4"
+    output_path = os.path.join(output_dir, output_filename)
+    
+    # Tentar encontrar o caminho do FFmpeg
+    ffmpeg_path = "ffmpeg"  # Padrão se estiver no PATH
+    
+    # Em sistemas Windows, procurar em locais comuns
+    if os.name == 'nt':
+        possible_paths = [
+            r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+            r"C:\Users\gusta\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-7.1.1-full_build\bin\ffmpeg.exe",
+            r"C:\ffmpeg\bin\ffmpeg.exe",
+            r"ffmpeg.exe"
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                ffmpeg_path = path
+                break
+    
+    instagram_logger.debug(f"Usando FFmpeg em: {ffmpeg_path}")
+    
+    try:
+        # Primeiro, obter informações sobre o vídeo original
+        probe_command = [
+            ffmpeg_path,
+            "-i", input_path,
+            "-v", "error"
+        ]
+        
+        probe_process = subprocess.Popen(
+            probe_command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        _, probe_stderr = probe_process.communicate()
+        instagram_logger.debug(f"Informações do vídeo original: {probe_stderr}")
+        
+        # Comando FFmpeg para converter para MP4 com codec H.264 compatível com Instagram
+        command = [
+            ffmpeg_path,
+            "-i", input_path,
+            "-c:v", "libx264",         # Codec de vídeo H.264
+            "-profile:v", "main",      # Perfil de vídeo (main é o mais compatível)
+            "-preset", "fast",         # Preset de codificação (equilibra velocidade e qualidade)
+            "-crf", "23",              # Qualidade do vídeo (menor = melhor)
+            "-c:a", "aac",             # Codec de áudio AAC
+            "-b:a", "128k",            # Bitrate do áudio
+            "-movflags", "+faststart", # Otimiza para streaming
+            "-pix_fmt", "yuv420p",     # Formato de pixel mais compatível
+            "-vf", "scale=720:1280",   # Dimensões fixas para Instagram (9:16)
+            "-r", "30",                # Framerate de 30fps (padrão para Instagram)
+            "-t", "60",                # Limitar duração a 60 segundos (para Stories)
+            "-y",                      # Sobrescrever se existir
+            output_path
+        ]
+        
+        instagram_logger.debug(f"Executando comando: {' '.join(command)}")
+        
+        # Executar FFmpeg
+        process = subprocess.Popen(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        
+        # Capturar saída
+        stdout, stderr = process.communicate()
+        
+        if process.returncode != 0:
+            instagram_logger.error(f"Erro na conversão: {stderr}")
+            
+            # Tentar abordagem alternativa mais simples
+            instagram_logger.info("Tentando método alternativo de conversão...")
+            alt_command = [
+                ffmpeg_path,
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-pix_fmt", "yuv420p",
+                "-y",
+                output_path
+            ]
+            
+            alt_process = subprocess.Popen(
+                alt_command, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            
+            alt_stdout, alt_stderr = alt_process.communicate()
+            
+            if alt_process.returncode != 0:
+                instagram_logger.error(f"Falha também no método alternativo: {alt_stderr}")
+                
+                # Tentar um terceiro método com configurações mínimas
+                instagram_logger.info("Tentando método de conversão com configurações mínimas...")
+                simple_command = [
+                    ffmpeg_path,
+                    "-i", input_path,
+                    "-y",
+                    output_path
+                ]
+                
+                simple_process = subprocess.Popen(
+                    simple_command, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+                
+                simple_stdout, simple_stderr = simple_process.communicate()
+                
+                if simple_process.returncode != 0:
+                    instagram_logger.error(f"Todos os métodos de conversão falharam. Último erro: {simple_stderr}")
+                    return None
+        
+        # Verificar se o arquivo foi criado
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            instagram_logger.info(f"Vídeo convertido com sucesso: {output_path}")
+            return output_path
+        else:
+            instagram_logger.error("Arquivo de saída não existe ou está vazio")
+            return None
+            
+    except Exception as e:
+        instagram_logger.error(f"Erro ao converter vídeo: {str(e)}")
+        return None
+
+def upload_to_s3(file_path, bucket_name="zindex123", region="sa-east-1"):
+    """
+    Faz upload de um arquivo para um bucket S3 e retorna a URL pública.
+    
+    Args:
+        file_path: Caminho do arquivo a ser enviado
+        bucket_name: Nome do bucket S3
+        region: Região AWS do bucket
+        
+    Returns:
+        URL pública do arquivo no S3 ou None se falhar
+    """
+    instagram_logger.info(f"Iniciando upload para S3: {file_path}")
+    
+    if not os.path.exists(file_path):
+        instagram_logger.error(f"Arquivo não encontrado: {file_path}")
+        return None
+    
+    # Credenciais da AWS (usar variáveis de ambiente em produção)
+    aws_access_key = "AKIAZ2K64GV7E757XR4G"
+    aws_secret_key = "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"
+    
+    # Nome do arquivo no S3 (usando timestamp e nome original para evitar conflitos)
+    filename = os.path.basename(file_path)
+    timestamp = int(time.time())
+    s3_filename = f"instagram_videos/{timestamp}_{filename}"
+    
+    try:
+        # Criar cliente S3
+        s3_client = boto3.client(
+            's3',
+            aws_access_key_id=aws_access_key,
+            aws_secret_access_key=aws_secret_key,
+            region_name=region
+        )
+        
+        # Upload do arquivo
+        instagram_logger.debug(f"Enviando arquivo para S3: {s3_filename}")
+        s3_client.upload_file(
+            file_path, 
+            bucket_name, 
+            s3_filename,
+            ExtraArgs={'ContentType': 'video/mp4'}  # Removido ACL: 'public-read' que estava causando erro
+        )
+        
+        # Gerar URL pública
+        try:
+            # Gerar URL pré-assinada válida por 24 horas (Instagram precisa de tempo para processar)
+            instagram_logger.debug(f"Gerando URL pré-assinada para S3: {s3_filename}")
+            s3_url = s3_client.generate_presigned_url(
+                'get_object',
+                Params={
+                    'Bucket': bucket_name,
+                    'Key': s3_filename
+                },
+                ExpiresIn=86400  # 24 horas
+            )
+            instagram_logger.info(f"Upload para S3 concluído com URL pré-assinada: {s3_url}")
+        except Exception as url_err:
+            instagram_logger.error(f"Erro ao gerar URL pré-assinada: {str(url_err)}")
+            # Tentar URL padrão como fallback
+            s3_url = f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_filename}"
+            instagram_logger.info(f"Usando URL S3 padrão: {s3_url}")
+        
+        return s3_url
+    
+    except NoCredentialsError:
+        instagram_logger.error("Credenciais da AWS inválidas")
+        return None
+    except ClientError as e:
+        instagram_logger.error(f"Erro no cliente S3: {str(e)}")
+        return None
+    except Exception as e:
+        instagram_logger.error(f"Erro ao fazer upload para S3: {str(e)}")
+        return None
+
+@router.post("/rate-limit-status")
+async def rate_limit_status(
+    request: Request,
+    body: dict,
+    jwt_token: str = Header(None, alias="jwt_token")
+):
+    """
+    Endpoint para obter o status de limite de publicação do Instagram.
+    """
+    # Verificar JWT
+    user_id = get_user_id_from_token(request, jwt_token)
+    user = get_current_user(request, jwt_token)
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuário não encontrado ou inativo")
+    
+    # Validar campos obrigatórios
+    required_fields = ["username", "type", "when", "video_url", "caption"]
+    for field in required_fields:
+        if field not in body:
+            instagram_logger.error(f"Campo obrigatório ausente: {field}")
+            raise HTTPException(status_code=400, detail=f"Campo obrigatório ausente: {field}")
+
+    # Buscar sessão do Instagram
+    instagram_logger.info(f"Buscando sessão para usuário {user_id} e conta {body['username']}")
+    session = execute_query(
+        """
+        SELECT * FROM instagram.instagram_sessions 
+        WHERE user_id = %s AND username = %s AND is_active = TRUE
+        """,
+        [user_id, body["username"]]
+    )
+
+    if not session:
+        instagram_logger.error(f"Sessão não encontrada para o usuário {body['username']}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sessão não encontrada para o usuário {body['username']}"
+        )
+
+    session_data = session[0]
+    instagram_logger.debug(f"Dados brutos da sessão: {json.dumps(dict(session_data), default=str)}")
+    
+    # Converter session_data de string para dict se necessário
+    try:
+        if isinstance(session_data["session_data"], str):
+            session_data_dict = json.loads(session_data["session_data"])
+        else:
+            session_data_dict = session_data["session_data"]
+            
+        instagram_logger.debug(f"Dados da sessão convertidos: {json.dumps(session_data_dict)}")
+        
+        # Extrair e limpar o token de acesso (remover possíveis caracteres inválidos)
+        access_token = session_data_dict.get("page_access_token") or session_data_dict.get("access_token")
+        if access_token:
+            # Limpar o token removendo possíveis caracteres inválidos
+            access_token = access_token.strip().strip('"').strip("'")
+            # Remover possíveis espaços ou caracteres especiais
+            access_token = ''.join(c for c in access_token if c.isalnum() or c in ['_', '-', '.'])
+            instagram_logger.debug(f"Token de acesso após limpeza: {access_token[:20]}... (truncado)")
+            
+        instagram_account_id = session_data_dict.get("id") or session_data_dict.get("account_id")
+        if instagram_account_id:
+            instagram_account_id = str(instagram_account_id).strip().strip('"').strip("'")
+            instagram_logger.debug(f"ID da conta Instagram após limpeza: {instagram_account_id}")
+            
+    except (json.JSONDecodeError, KeyError) as e:
+        instagram_logger.error(f"Erro ao converter dados da sessão: {str(e)}")
+        instagram_logger.error(f"Dados brutos da sessão: {session_data}")
+        raise HTTPException(
+            status_code=400,
+            detail="Dados de sessão inválidos. Reconecte sua conta do Instagram."
+        )
+
+    if not access_token or not instagram_account_id:
+        instagram_logger.error("Token ou ID da conta ausentes nos dados da sessão")
+        raise HTTPException(
+            status_code=400,
+            detail="Dados de sessão inválidos. Reconecte sua conta do Instagram."
+        )
+
+    try:
+        # Verificar validade do token usando endpoint do Instagram Graph API
+        instagram_logger.info("Verificando validade do token...")
+        verify_url = f"https://graph.instagram.com/me"
+        verify_params = {"access_token": access_token}
+        instagram_logger.debug(f"URL de verificação: {verify_url}")
+        instagram_logger.debug(f"Parâmetros de verificação: {verify_params}")
+        
+        verify_response = requests.get(verify_url, params=verify_params)
+        instagram_logger.debug(f"Resposta da verificação: {verify_response.text}")
+        
+        if verify_response.status_code != 200:
+            instagram_logger.error(f"Erro na verificação do token: {verify_response.text}")
+            # Se o token for inválido, vamos tentar revogar a sessão automaticamente
+            try:
+                current_time = datetime.now(timezone.utc).isoformat()
+                instagram_logger.info(f"Revogando sessão para {body['username']}")
+                execute_query(
+                    """
+                    DELETE FROM instagram.instagram_sessions 
+                    WHERE user_id = %s 
+                    AND username = %s 
+                    AND is_active = TRUE
+                    """,
+                    [user_id, body["username"]],
+                    fetch=False
+                )
+                instagram_logger.info(f"Sessão revogada com sucesso para {body['username']}")
+            except Exception as e:
+                instagram_logger.error(f"Erro ao revogar sessão automaticamente: {str(e)}")
+                
+            raise HTTPException(
+                status_code=401,
+                detail="Token de acesso inválido ou expirado. Por favor, reconecte sua conta do Instagram."
+            )
+
+        try:
+            # Download do vídeo
+            instagram_logger.info(f"Baixando vídeo: {body['video_url']}")
+            try:
+                # Verificar se é URL do TikTok
+                is_tiktok = "tiktok" in body["video_url"].lower()
+                if is_tiktok:
+                    instagram_logger.info("Detectada URL do TikTok, usando tratamento especial")
+                
+                # Verificar se a URL é acessível
+                head_response = requests.head(body["video_url"], allow_redirects=True, timeout=10)
+                head_response.raise_for_status()
+                
+                # Verificar o tipo de conteúdo
+                content_type = head_response.headers.get('Content-Type', '')
+                instagram_logger.debug(f"Tipo de conteúdo do vídeo: {content_type}")
+                
+                if not content_type.startswith('video/'):
+                    instagram_logger.warning(f"URL pode não ser um vídeo direto. Content-Type: {content_type}")
+                
+                # Tentar obter o tamanho do vídeo
+                content_length = head_response.headers.get('Content-Length')
+                if content_length:
+                    size_mb = int(content_length) / (1024 * 1024)
+                    instagram_logger.debug(f"Tamanho do vídeo: {size_mb:.2f} MB")
+                    
+                    # Stories têm limite de tamanho
+                    if body["type"].lower() == "story" and size_mb > 15:
+                        instagram_logger.warning(f"Vídeo pode ser muito grande para story: {size_mb:.2f} MB (limite ~15MB)")
+                
+                # Baixar o vídeo com streaming
+                video_response = requests.get(body["video_url"], stream=True, timeout=30)
+                video_response.raise_for_status()
+                
+                # Criar arquivo temporário
+                import tempfile
+                temp_dir = tempfile.gettempdir()
+                video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
+                
+                # Salvar vídeo
+                with open(video_path, 'wb') as f:
+                    for chunk in video_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verificar se o arquivo foi criado corretamente
+                if not os.path.exists(video_path) or os.path.getsize(video_path) == 0:
+                    instagram_logger.error("Arquivo de vídeo vazio ou não criado")
+                    raise HTTPException(status_code=400, detail="Erro ao baixar vídeo - arquivo inválido")
+                
+                video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                instagram_logger.debug(f"Vídeo baixado para: {video_path} ({video_size_mb:.2f} MB)")
+                
+                # Converter o vídeo para formato compatível com Instagram usando FFmpeg
+                instagram_logger.info("Convertendo vídeo para formato compatível com Instagram...")
+                try:
+                    # Criar diretório temporário para vídeos convertidos
+                    temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted")
+                    os.makedirs(temp_converted_dir, exist_ok=True)
+                    
+                    # Converter o vídeo
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
+                    
+                    if converted_video_path and os.path.exists(converted_video_path):
+                        instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
+                        
+                        # Substituir o caminho do vídeo original pelo convertido
+                        video_path = converted_video_path
+                        
+                        # Fazer upload do vídeo convertido para o S3
+                        instagram_logger.info("Enviando vídeo convertido para o S3...")
+                        s3_video_url = upload_to_s3(video_path)
+                        
+                        if s3_video_url:
+                            instagram_logger.info(f"Vídeo enviado com sucesso para o S3: {s3_video_url}")
+                            # Substituir a URL original pelo link do S3
+                            body["video_url"] = s3_video_url
+                        else:
+                            instagram_logger.warning("Falha ao enviar vídeo para S3, usando URL original")
+                        
+                        # Atualizar informações de tamanho
+                        video_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                        instagram_logger.debug(f"Vídeo convertido: {video_path} ({video_size_mb:.2f} MB)")
+                    else:
+                        instagram_logger.warning("Conversão de vídeo falhou, continuando com o vídeo original")
+                except Exception as conv_err:
+                    instagram_logger.error(f"Erro na conversão do vídeo: {str(conv_err)}")
+                    instagram_logger.warning("Continuando com o vídeo original sem conversão")
+                
+                # Para TikTok, tentar fazer upload direto para o Instagram
+                if is_tiktok and body["type"].lower() == "story":
+                    instagram_logger.info("Para vídeos de TikTok, usando URL direta em vez de download")
+                    # Continuar usando a URL direta neste caso
+                
+            except requests.RequestException as e:
+                instagram_logger.error(f"Erro ao baixar vídeo: {str(e)}")
+                if hasattr(e, 'response') and e.response:
+                    instagram_logger.error(f"Status: {e.response.status_code}, Resposta: {e.response.text[:200]}")
+                raise HTTPException(status_code=400, detail=f"Erro ao baixar vídeo: {str(e)}")
+                
+            except Exception as e:
+                instagram_logger.error(f"Erro inesperado ao baixar vídeo: {str(e)}")
+                raise HTTPException(status_code=400, detail=f"Erro ao processar vídeo: {str(e)}")
+
+            # Preparar caption com hashtags
+            caption = body["caption"]
+            if body.get("hashtags"):
+                caption = f"{caption}\n\n{body['hashtags']}"
+
+            # Obter ID do usuário do Instagram
+            instagram_logger.info("Obtendo ID do usuário do Instagram")
+            instagram_user_id = session_data_dict.get("account_id")
+            
+            if not instagram_user_id:
+                instagram_logger.error("ID do usuário do Instagram não encontrado")
+                raise HTTPException(
+                    status_code=400,
+                    detail="Configuração incompleta. Reconecte sua conta do Instagram."
+                )
+
+            # Iniciar upload do container
+            instagram_logger.info(f"Iniciando upload de {body['type'].lower()}")
+            
+            # Definir tipo de mídia e endpoint correto baseado no tipo de post
+            if body["type"].lower() == "story":
+                # Para stories, usar STORIES conforme documentação oficial
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
+                container_data = {
+                    "media_type": "STORIES",  # Tipo correto para stories
+                    "video_url": body["video_url"],
+                    "access_token": access_token
+                }
+            elif body["type"].lower() == "reel":
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
+                container_data = {
+                    "media_type": "REELS",  # Tipo específico para reels
+                    "video_url": body["video_url"],
+                    "caption": caption,
+                    "access_token": access_token
+                }
+            else:  # feed
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
+                container_data = {
+                    "media_type": "REELS",  # Usar REELS para vídeos de feed (conforme erro anterior)
+                    "video_url": body["video_url"],
+                    "caption": caption,
+                    "access_token": access_token
+                }
+
+            # Postar com arquivo anexado
+            try:
+                container_response = requests.post(container_url, data=container_data)
+                instagram_logger.debug(f"Resposta com upload direto: {container_response.text}")
+            except Exception as upload_err:
+                instagram_logger.error(f"Erro no upload direto: {str(upload_err)}")
+                
+                # Fallback para URL se o upload direto falhar
+                instagram_logger.info("Fallback para método de URL após falha no upload direto")
+                container_data = {
+                    "media_type": "STORIES",  # Tipo correto para stories
+                    "video_url": body["video_url"],
+                    "access_token": access_token
+                }
+                container_response = requests.post(container_url, data=container_data)
+
+            # Se for agendado, adicionar timestamp
+            if body["when"] == "schedule" and body.get("schedule_date"):
+                try:
+                    schedule_time = datetime.fromisoformat(body["schedule_date"].replace('Z', '+00:00'))
+                    container_data["publishing_type"] = "SCHEDULED"
+                    container_data["scheduled_publish_time"] = int(schedule_time.timestamp())
+                except ValueError as e:
+                    instagram_logger.error(f"Data de agendamento inválida: {str(e)}")
+                    raise HTTPException(status_code=400, detail=f"Data de agendamento inválida: {str(e)}")
+
+            instagram_logger.debug(f"URL do container: {container_url}")
+            instagram_logger.debug(f"Dados do container: {json.dumps(container_data)}")
+
+            # Se não estiver usando o upload direto de arquivo, verifica a resposta aqui
+            if 'container_response' not in locals() or container_response is None:
+                container_response = requests.post(container_url, data=container_data)
+                instagram_logger.debug(f"Resposta da criação do container: {container_response.text}")
+            
+            if container_response.status_code != 200:
+                instagram_logger.error(f"Erro na criação do container: {container_response.text}")
+                error_data = container_response.json()
+                
+                # Extrair e logar códigos de erro específicos
+                if "error" in error_data:
+                    error_code = error_data["error"].get("code")
+                    error_subcode = error_data["error"].get("error_subcode")
+                    instagram_logger.error(f"Erro na criação do container - Código: {error_code}, Subcódigo: {error_subcode}")
+                    
+                    # Tratamento específico para erro de formato de vídeo
+                    if error_code == 352 or (error_subcode and error_subcode == 2207026):
+                        instagram_logger.error("Erro de formato de vídeo detectado")
+                        format_error_msg = """
+Formato de vídeo não suportado pelo Instagram. A conversão automática não resolveu o problema.
+Por favor, tente:
+
+1. Usar apenas vídeos no formato MP4 ou MOV (MPEG-4 Part 14)
+2. Verificar se a duração do vídeo está dentro dos limites permitidos:
+   - Para Stories: entre 3 e 60 segundos
+   - Para Reels: entre 3 segundos e 90 segundos
+3. Garantir que o tamanho do arquivo é menor que 100MB
+4. Usar codecs de vídeo H.264 ou H.265
+
+Para vídeos do TikTok, é recomendado baixar o vídeo e convertê-lo com um software como o VLC antes de fazer upload.
+"""
+                        raise HTTPException(status_code=400, detail=format_error_msg)
+                
+                friendly_error = interpret_instagram_error(error_data)
+                
+                # Para vídeos do TikTok, adicionar sugestão específica
+                if "tiktok" in body["video_url"].lower():
+                    friendly_error += " Para vídeos do TikTok, tente baixar o vídeo localmente primeiro e depois fazer upload."
+                
+                raise HTTPException(status_code=400, detail=f"Erro ao criar container de mídia: {friendly_error}")
+            
+            container_response.raise_for_status()
+            
+            # Para stories, o processo agora é o mesmo dos vídeos normais,
+            # mas com o parâmetro is_story
+            container_id = container_response.json().get("id")
+            if not container_id:
+                instagram_logger.error("Falha ao obter ID do container")
+                raise HTTPException(status_code=500, detail="Falha ao criar container de mídia")
+
+            instagram_logger.info(f"Container criado com sucesso: {container_id}")
+
+            # Verificar status do container antes de tentar publicar
+            instagram_logger.info("Verificando status do container antes de publicar...")
+            status_url = f"https://graph.instagram.com/v18.0/{container_id}"
+            status_params = {"access_token": access_token, "fields": "status_code"}
+            
+            # Aguardar que o container esteja pronto para publicação
+            # De acordo com a documentação, deve-se verificar no máximo 1x por minuto por até 5 minutos
+            max_attempts = 10
+            attempt = 0
+            container_ready = False
+            
+            while attempt < max_attempts:
+                attempt += 1
+                instagram_logger.debug(f"Verificando status do container (tentativa {attempt}/{max_attempts})")
+                
+                try:
+                    status_response = requests.get(status_url, params=status_params)
+                    instagram_logger.debug(f"Resposta do status: {status_response.text}")
+                    
+                    if status_response.status_code == 200:
+                        status_data = status_response.json()
+                        status_code = status_data.get("status_code", "")
+                        
+                        if status_code == "FINISHED":
+                            instagram_logger.info("Container pronto para publicação")
+                            container_ready = True
+                            break
+                        elif status_code == "PUBLISHED":
+                            instagram_logger.info("Container já foi publicado")
+                            container_ready = True
+                            break
+                        elif status_code == "ERROR" or status_code == "EXPIRED":
+                            # Tentar obter mais detalhes sobre o erro
+                            error_details = ""
+                            error_data = {}
+                            try:
+                                # Primeiro, tentar obter mais detalhes com o endpoint padrão
+                                error_detail_url = f"https://graph.instagram.com/v18.0/{container_id}"
+                                error_detail_params = {
+                                    "access_token": access_token,
+                                    "fields": "status_code,status,error"  # Adicionar o campo error
+                                }
+                                error_detail_response = requests.get(error_detail_url, params=error_detail_params)
+                                instagram_logger.debug(f"Detalhes do erro (1): {error_detail_response.text}")
+                                
+                                if error_detail_response.status_code == 200:
+                                    error_details = error_detail_response.text
+                                    response_json = error_detail_response.json()
+                                    
+                                    # Verificar se temos o objeto error
+                                    if "error" in response_json:
+                                        error_data = response_json
+                                        instagram_logger.debug(f"Encontrado objeto 'error' nos detalhes")
+                                
+                                # Se não conseguimos o objeto error, tentar fazer uma chamada que provavelmente falhará
+                                # para obter uma resposta de erro completa
+                                if not error_data.get("error"):
+                                    instagram_logger.debug("Tentando obter detalhes do erro com chamada secundária")
+                                    
+                                    # Tentar publicar o container incorreto para forçar um erro detalhado
+                                    invalid_publish_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media_publish"
+                                    invalid_publish_params = {
+                                        "creation_id": container_id,
+                                        "access_token": access_token
+                                    }
+                                    
+                                    try:
+                                        error_response = requests.post(invalid_publish_url, data=invalid_publish_params)
+                                        if error_response.status_code != 200 and "error" in error_response.json():
+                                            error_data = error_response.json()
+                                            instagram_logger.debug(f"Detalhes do erro (2): {error_response.text}")
+                                    except Exception as pub_error:
+                                        instagram_logger.error(f"Erro ao tentar obter detalhes secundários: {str(pub_error)}")
+                                        
+                            except Exception as detail_err:
+                                instagram_logger.error(f"Erro ao obter detalhes: {str(detail_err)}")
+                            
+                            # Interpretar o erro
+                            friendly_error = ""
+                            if error_data and "error" in error_data:
+                                instagram_logger.debug(f"Código de erro encontrado: {error_data['error'].get('code')}, Subcódigo: {error_data['error'].get('error_subcode')}")
+                                friendly_error = interpret_instagram_error(error_data)
+                            else:
+                                # Códigos de status conhecidos
+                                status_errors = {
+                                    "ERROR": "Erro ao processar o vídeo. Verifique o formato e tamanho.",
+                                    "EXPIRED": "O container expirou. Tente novamente.",
+                                    "IN_PROGRESS": "O vídeo ainda está em processamento.",
+                                    "PUBLISHED": "O vídeo já foi publicado.",
+                                    "SCHEDULED": "O vídeo está agendado para publicação."
+                                }
+                                friendly_error = status_errors.get(status_code, f"Erro no processamento do container: {status_code}")
+                                
+                            error_msg = f"{friendly_error} Detalhes: {error_details}"
+                            instagram_logger.error(error_msg)
+
+                            # Para stories, tentar abordagem alternativa com REELS
+                            if body["type"].lower() == "story" and attempt == 1:
+                                instagram_logger.info("Tentando abordagem alternativa para story usando REELS...")
+                                
+                                # Criar novo container com tipo REELS para story
+                                alt_container_data = {
+                                    "media_type": "REELS",
+                                    "video_url": body["video_url"],
+                                    "caption": caption if caption else "Story",
+                                    "access_token": access_token
+                                }
+                                
+                                try:
+                                    alt_container_response = requests.post(container_url, data=alt_container_data)
+                                    instagram_logger.debug(f"Resposta da criação alternativa: {alt_container_response.text}")
+                                    
+                                    if alt_container_response.status_code == 200:
+                                        container_id = alt_container_response.json().get("id")
+                                        if container_id:
+                                            instagram_logger.info(f"Container alternativo criado: {container_id}")
+                                            continue  # Voltar para a verificação com o novo container
+                                except Exception as alt_err:
+                                    instagram_logger.error(f"Erro na criação alternativa: {str(alt_err)}")
+                            
+                            # Se tiver problemas com vídeos do TikTok, sugerir alternativa
+                            if "tiktok" in body["video_url"].lower():
+                                instagram_logger.warning("Vídeo do TikTok detectado - pode haver incompatibilidade")
+                                sugestao = " Para vídeos do TikTok, tente baixar o vídeo localmente e depois fazer upload, ou use uma URL de vídeo de outra plataforma."
+                            
+                            # Sugestões com base no erro
+                            sugestao = ""
+                            if "muito grande" in error_msg.lower():
+                                sugestao = " Tente com um vídeo menor (menos de 8MB)."
+                            elif "formato" in error_msg.lower():
+                                sugestao = " Tente com um vídeo no formato MP4."
+                            elif "proporção" in error_msg.lower():
+                                sugestao = " Tente com um vídeo em formato vertical (9:16) para stories."
+                            
+                            # Se não for story ou a abordagem alternativa falhar
+                            raise HTTPException(status_code=400, detail=f"{friendly_error}{sugestao}")
+                        elif status_code == "IN_PROGRESS":
+                            instagram_logger.debug("Container ainda em processamento...")
+                        else:
+                            instagram_logger.warning(f"Status desconhecido: {status_code}")
+                    else:
+                        instagram_logger.warning(f"Erro ao verificar status (HTTP {status_response.status_code})")
+                        
+                        # Verificar se é um erro de limite de requisições
+                        try:
+                            error_data = status_response.json()
+                            if "error" in error_data:
+                                error_code = error_data["error"].get("code")
+                                error_subcode = error_data["error"].get("error_subcode")
+                                
+                                # Códigos relacionados a limite de requisições
+                                if error_code == 4 and error_subcode == 1349210:
+                                    instagram_logger.warning("Limite de requisições da API atingido, aguardando mais tempo")
+                                    time.sleep(10)  # Aguardar mais tempo antes da próxima tentativa
+                                    continue
+                                
+                                # Logar o erro para diagnóstico
+                                instagram_logger.error(f"Erro na verificação - Código: {error_code}, Subcódigo: {error_subcode}")
+                                instagram_logger.error(f"Mensagem de erro: {error_data['error'].get('message')}")
+                        except Exception as parse_err:
+                            instagram_logger.error(f"Erro ao parsear resposta de erro: {str(parse_err)}")
+                    
+                    # Ajustar o tempo de espera baseado na tentativa
+                    if attempt < 3:
+                        time.sleep(60)  # Primeiras tentativas, aguardar 6 segundos
+                    else:
+                        time.sleep(60)  # Tentativas posteriores, aguardar mais tempo
+                    
+                except Exception as e:
+                    instagram_logger.error(f"Erro ao verificar status: {str(e)}")
+                    time.sleep(10)  # Em caso de erro, aguardar mais tempo
+            
+            if not container_ready:
+                instagram_logger.error("Timeout aguardando processamento do container")
+                raise HTTPException(
+                    status_code=408,
+                    detail="O vídeo está demorando muito para processar. Por favor, tente novamente com um vídeo menor ou aguarde alguns minutos."
+                )
+
+            # Tentar publicar
+            instagram_logger.info("Iniciando publicação do vídeo")
+            publish_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media_publish"
+            publish_data = {
+                "creation_id": container_id,
+                "access_token": access_token
+            }
+
+            instagram_logger.debug(f"URL de publicação: {publish_url}")
+            instagram_logger.debug(f"Dados de publicação: {json.dumps(publish_data)}")
+
+            # Tentar publicar algumas vezes
+            max_publish_attempts = 3
+            publish_attempt = 0
+            publish_success = False
+            publish_response = None
+            last_error = None
+
+            while publish_attempt < max_publish_attempts and not publish_success:
+                publish_attempt += 1
+                instagram_logger.info(f"Tentativa de publicação {publish_attempt}/{max_publish_attempts}")
+
+                try:
+                    # Publicar o container
+                    publish_response = requests.post(publish_url, data=publish_data)
+                    instagram_logger.debug(f"Resposta da publicação: {publish_response.text}")
+                    
+                    if publish_response.status_code == 200:
+                        publish_success = True
+                        break
+                    else:
+                        error_data = publish_response.json()
+                        error_message = error_data.get('error', {}).get('message', 'Erro desconhecido')
+                        friendly_error = interpret_instagram_error(error_data)
+                        last_error = friendly_error
+                        
+                        instagram_logger.error(f"Erro de publicação: {error_message}")
+                        instagram_logger.error(f"Erro interpretado: {friendly_error}")
+                        
+                        if "Media ID is not available" in error_message:
+                            instagram_logger.warning("Mídia ainda não disponível, aguardando mais...")
+                            time.sleep(5)  # Esperar mais 5 segundos antes da próxima tentativa
+                        else:
+                            # Para stories que falham, tentar converter o tipo
+                            if body["type"].lower() == "story" and publish_attempt == 1:
+                                instagram_logger.info("Tentando opção alternativa para story...")
+                                
+                                # Tentar criar novo container com REELS como alternativa
+                                alt_container_data = {
+                                    "media_type": "REELS",  # Tentar com REELS como alternativa
+                                    "video_url": body["video_url"],
+                                    "caption": caption if caption else "",
+                                    "access_token": access_token
+                                }
+                                
+                                try:
+                                    alt_container_response = requests.post(
+                                        f"https://graph.instagram.com/v18.0/{instagram_user_id}/media", 
+                                        data=alt_container_data
+                                    )
+                                    
+                                    instagram_logger.debug(f"Resposta da criação alternativa (REELS): {alt_container_response.text}")
+                                    
+                                    if alt_container_response.status_code == 200:
+                                        alt_container_id = alt_container_response.json().get("id")
+                                        if alt_container_id:
+                                            instagram_logger.info(f"Container alternativo (REELS) criado: {alt_container_id}")
+                                            # Atualizar ID para tentar novamente
+                                            publish_data["creation_id"] = alt_container_id
+                                            # Não incrementar a contagem de tentativas
+                                            publish_attempt -= 1
+                                            # Aguardar um pouco para o container ser processado
+                                            time.sleep(5)
+                                            continue
+                                except Exception as alt_err:
+                                    instagram_logger.error(f"Erro na criação alternativa: {str(alt_err)}")
+
+                            raise HTTPException(status_code=400, detail=f"Erro ao publicar: {error_message}")
+                
+                except Exception as e:
+                    instagram_logger.error(f"Erro na tentativa de publicação {publish_attempt}: {str(e)}")
+                    last_error = str(e)
+                    if publish_attempt == max_publish_attempts:
+                        raise HTTPException(status_code=400, detail=f"Erro ao publicar: {str(e)}")
+                    time.sleep(5)
+
+            if not publish_success:
+                instagram_logger.error(f"Todas as tentativas de publicação falharam. Último erro: {last_error}")
+                
+                # Sugerir solução com base no erro
+                sugestao = ""
+                if "muito grande" in last_error.lower():
+                    sugestao = " Tente com um vídeo menor (menos de 8MB)."
+                elif "formato" in last_error.lower():
+                    sugestao = " Tente com um vídeo no formato MP4."
+                elif "limite" in last_error.lower():
+                    sugestao = " Tente novamente amanhã quando o limite diário for reiniciado."
+                elif "proporção" in last_error.lower():
+                    sugestao = " Tente com um vídeo em formato vertical (9:16) para stories."
+                
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Não foi possível publicar o vídeo: {last_error}{sugestao}"
+                )
+
+            # Limpar arquivo temporário
+            try:
+                os.remove(video_path)
+            except Exception as e:
+                instagram_logger.warning(f"Erro ao remover arquivo temporário: {str(e)}")
+
+            # Mensagem específica para o tipo de conteúdo
+            content_type_msg = {
+                "reel": "Reel publicado com sucesso",
+                "feed": "Vídeo publicado com sucesso no feed",
+                "story": "Story publicado com sucesso"
+            }.get(body["type"].lower(), "Conteúdo publicado com sucesso")
+
+            return {
+                "status": "success",
+                "message": content_type_msg if body["when"] == "now" else f"{body['type'].capitalize()} agendado com sucesso",
+                "post_id": publish_response.json().get("id")
+            }
+
+        except requests.RequestException as e:
+            error_msg = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_data = e.response.json()
+                    error_msg = error_data.get('error', {}).get('message', str(e))
+                except:
+                    error_msg = e.response.text
+
+            instagram_logger.error(f"Erro ao publicar: {error_msg}")
+            raise HTTPException(status_code=400, detail=f"Erro ao publicar no Instagram: {error_msg}")
+
+        except Exception as e:
+            instagram_logger.error(f"Erro inesperado: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+        finally:
+            # Garantir que o arquivo temporário seja removido
+            try:
+                if 'video_path' in locals():
+                    os.remove(video_path)
+                    instagram_logger.debug(f"Arquivo temporário removido: {video_path}")
+                
+                # Limpar diretório de arquivos convertidos
+                temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted") if 'video_path' in locals() else None
+                if temp_converted_dir and os.path.exists(temp_converted_dir):
+                    instagram_logger.debug(f"Limpando diretório temporário: {temp_converted_dir}")
+                    try:
+                        for temp_file in os.listdir(temp_converted_dir):
+                            file_path = os.path.join(temp_converted_dir, temp_file)
+                            if os.path.isfile(file_path):
+                                os.remove(file_path)
+                        os.rmdir(temp_converted_dir)
+                    except Exception as cleanup_err:
+                        instagram_logger.warning(f"Erro ao limpar diretório temporário: {str(cleanup_err)}")
+            except Exception as e:
+                instagram_logger.warning(f"Erro ao remover arquivos temporários: {str(e)}")
+
+    except requests.RequestException as e:
+        error_msg = str(e)
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_data = e.response.json()
+                error_msg = error_data.get('error', {}).get('message', str(e))
+            except:
+                error_msg = e.response.text
+
+        print(f"[INSTAGRAM_API] Erro ao publicar: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Erro ao publicar no Instagram: {error_msg}")
+
+    except Exception as e:
+        print(f"[INSTAGRAM_API] Erro inesperado: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+    finally:
+        # Garantir que o arquivo temporário seja removido
+        try:
+            if 'video_path' in locals():
+                os.remove(video_path)
+                instagram_logger.debug(f"Arquivo temporário removido: {video_path}")
+            
+            # Limpar diretório de arquivos convertidos
+            temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted") if 'video_path' in locals() else None
+            if temp_converted_dir and os.path.exists(temp_converted_dir):
+                instagram_logger.debug(f"Limpando diretório temporário: {temp_converted_dir}")
+                try:
+                    for temp_file in os.listdir(temp_converted_dir):
+                        file_path = os.path.join(temp_converted_dir, temp_file)
+                        if os.path.isfile(file_path):
+                            os.remove(file_path)
+                    os.rmdir(temp_converted_dir)
+                except Exception as cleanup_err:
+                    instagram_logger.warning(f"Erro ao limpar diretório temporário: {str(cleanup_err)}")
+        except Exception as e:
+            instagram_logger.warning(f"Erro ao remover arquivos temporários: {str(e)}")
