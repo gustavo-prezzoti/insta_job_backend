@@ -29,7 +29,7 @@ SOAX_PASSWORD = os.environ.get("SOAX_PASSWORD", "")
 SOAX_API_KEY = os.environ.get("SOAX_API_KEY", "")
 
 # CORS Settings
-CORS_ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "*").split(",")
+CORS_ALLOW_ORIGINS = os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:8080,https://insta-job-igff.vercel.app").split(",")
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_METHODS = ["*"]
 CORS_ALLOW_HEADERS = ["*"]
