@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header, HTTPException, Request
+from datetime import datetime, timezone
 from app.models.scheduled_post import UpdateScheduledPostRequest
 from app.core.security import get_user_id_from_token
-from app.services.auth import get_user_from_db
+from app.core.database import get_user_from_db
 from app.services.scheduled_posts import (
     get_scheduled_posts, update_scheduled_post, delete_scheduled_post
 )

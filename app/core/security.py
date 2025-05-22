@@ -3,7 +3,7 @@ import jwt
 from fastapi import HTTPException, Header, Request
 from passlib.context import CryptContext
 from app.core.config import JWT_SECRET, JWT_EXPIRATION
-from app.services.auth import get_user_from_db
+from app.core.database import get_user_from_db
 
 # Password hashing configuration
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")

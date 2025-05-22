@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Header, HTTPException
 from app.models.user import LoginRequest
-from app.services.auth import authenticate_user, get_user_from_db
+from app.services.auth import authenticate_user
+from app.core.database import get_user_from_db
 from app.core.security import verify_jwt
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])

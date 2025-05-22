@@ -1,10 +1,12 @@
 from datetime import datetime, timezone, timedelta
+import os
 from fastapi import HTTPException
 from app.core.postgres import execute_query
 from app.services.instagram import publish_to_instagram
 from app.services.instagram_graph import publish_to_instagram as graph_publish_to_instagram
-from app.services.auth import get_user_from_db
+from app.core.database import get_user_from_db
 from app.utils.serialization import clean_for_json
+from app.models.scheduled_post import ScheduledPostStatus
 
 def get_scheduled_posts(user_id: int):
     """

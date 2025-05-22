@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from app.core.postgres import execute_query
 from app.core.security import verify_password, hash_password, is_password_hashed, create_jwt_token
+from app.core.database import get_user_from_db
 
 def authenticate_user(email: str, password: str):
     """
@@ -121,29 +122,6 @@ def authenticate_user(email: str, password: str):
             "subscription_end_date": current_plan_end_date
         }
     }
-
-def get_user_from_db(user_id: int):
-    """
-    Verifica se o usuário existe e está ativo no Supabase.
-    
-    Args:
-        user_id: ID do usuário
-        
-    Returns:
-        Dict com informações do usuário ou None se não existir
-    """
-    query = """
-    SELECT * FROM kiwify_users
-    WHERE id = %s
-    """
-    params = (user_id,)
-    
-    result = execute_query(query, params)
-    
-    if not result or not result[0].get("status", "active"):
-        return None
-        
-    return result[0]
 
 def check_subscription(user, check_if_exists=False):
     """

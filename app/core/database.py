@@ -4,27 +4,26 @@ import json
 
 def get_user_from_db(user_id: int):
     """
-    Get user from PostgreSQL database
+    Verifica se o usuário existe e está ativo no Supabase.
     
     Args:
-        user_id: User ID to look up
+        user_id: ID do usuário
         
     Returns:
-        User data dict or None if not found or inactive
+        Dict com informações do usuário ou None se não existir
     """
-    try:
-        query = "SELECT * FROM kiwify_users WHERE id = %s"
-        params = (user_id,)
-        
-        result = execute_query(query, params)
-        
-        if not result:
-            return None
-            
-        return result[0]
-    except Exception as e:
-        print(f"Erro ao buscar usuário do banco de dados: {str(e)}")
+    query = """
+    SELECT * FROM kiwify_users
+    WHERE id = %s
+    """
+    params = (user_id,)
+    
+    result = execute_query(query, params)
+    
+    if not result or not result[0].get("status", "active"):
         return None
+        
+    return result[0]
 
 def get_instagram_session(user_id: int, username: str):
     """

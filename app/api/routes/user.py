@@ -1,7 +1,8 @@
 from fastapi import APIRouter, Header, HTTPException
 from datetime import datetime, timezone
 from app.models.user import PasswordUpdateRequest, ForcePasswordUpdateRequest, UserUpdateRequest, UserResponse
-from app.services.auth import get_user_from_db, check_subscription
+from app.services.auth import check_subscription
+from app.core.database import get_user_from_db
 from app.core.security import verify_jwt, verify_password, hash_password
 from app.core.postgres import execute_query
 
