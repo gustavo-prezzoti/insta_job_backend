@@ -636,18 +636,22 @@ async def publish_to_instagram(
             
             # Definir tipo de mídia e endpoint correto baseado no tipo de post
             if body["type"].lower() == "story":
-                # Endpoint específico para stories
-                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/stories"
+                # Para stories precisamos usar o ID de página do Facebook e outro endpoint
+                # As permissões necessárias são diferentes
+                # Vamos usar o endpoint de contêiner normal e publicar como story 
+                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
-                    "media_type": "VIDEO",
+                    "media_type": "REELS",  # Usar REELS para todos os vídeos
                     "video_url": body["video_url"],
-                    "access_token": access_token
+                    "caption": caption,
+                    "access_token": access_token,
+                    "is_story": "true"  # Indicar que é um story
                 }
             else:
                 # Endpoint para feed/reels
                 container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
-                    "media_type": "REELS" if body["type"].lower() == "reel" else "VIDEO",
+                    "media_type": "REELS",  # Sempre usar REELS, o tipo VIDEO foi descontinuado
                     "video_url": body["video_url"],
                     "caption": caption,
                     "access_token": access_token
@@ -677,29 +681,8 @@ async def publish_to_instagram(
                 
             container_response.raise_for_status()
             
-            # Para stories, o processo é diferente - a publicação é imediata
-            if body["type"].lower() == "story":
-                story_id = container_response.json().get("id")
-                if not story_id:
-                    instagram_logger.error("Falha ao obter ID do story")
-                    raise HTTPException(status_code=500, detail="Falha ao publicar story")
-                
-                instagram_logger.info(f"Story publicado com sucesso: {story_id}")
-                
-                # Limpar arquivo temporário
-                try:
-                    if 'video_path' in locals():
-                        os.remove(video_path)
-                except Exception as e:
-                    instagram_logger.warning(f"Erro ao remover arquivo temporário: {str(e)}")
-                
-                return {
-                    "status": "success",
-                    "message": "Story publicado com sucesso",
-                    "post_id": story_id
-                }
-            
-            # Para feed e reels, seguimos o fluxo normal
+            # Para stories, o processo agora é o mesmo dos vídeos normais,
+            # mas com o parâmetro is_story
             container_id = container_response.json().get("id")
             if not container_id:
                 instagram_logger.error("Falha ao obter ID do container")
@@ -815,9 +798,16 @@ async def publish_to_instagram(
             except Exception as e:
                 instagram_logger.warning(f"Erro ao remover arquivo temporário: {str(e)}")
 
+            # Mensagem específica para o tipo de conteúdo
+            content_type_msg = {
+                "reel": "Reel publicado com sucesso",
+                "feed": "Vídeo publicado com sucesso no feed",
+                "story": "Story publicado com sucesso"
+            }.get(body["type"].lower(), "Conteúdo publicado com sucesso")
+
             return {
                 "status": "success",
-                "message": "Vídeo publicado com sucesso" if body["when"] == "now" else "Vídeo agendado com sucesso",
+                "message": content_type_msg if body["when"] == "now" else f"{body['type'].capitalize()} agendado com sucesso",
                 "post_id": publish_response.json().get("id")
             }
 
