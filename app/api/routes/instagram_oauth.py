@@ -635,30 +635,29 @@ async def publish_to_instagram(
             instagram_logger.info(f"Iniciando upload de {body['type'].lower()}")
             
             # Definir tipo de mídia e endpoint correto baseado no tipo de post
+            container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
+            
+            # Configurar dados do container conforme documentação oficial
             if body["type"].lower() == "story":
-                # Para stories precisamos usar o ID de página do Facebook e outro endpoint
-                # As permissões necessárias são diferentes
-                # Vamos usar o endpoint de contêiner normal e publicar como story 
-                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
                 container_data = {
-                    "media_type": "REELS",  # Usar REELS para todos os vídeos
+                    "media_type": "STORIES",  # Tipo específico para stories
                     "video_url": body["video_url"],
-                    "caption": caption,
-                    "access_token": access_token,
-                    "is_story": "true"  # Indicar que é um story
+                    "access_token": access_token
                 }
-            else:
-                # Endpoint para feed/reels
-                container_url = f"https://graph.instagram.com/v18.0/{instagram_user_id}/media"
+            elif body["type"].lower() == "reel":
                 container_data = {
-                    "media_type": "REELS",  # Sempre usar REELS, o tipo VIDEO foi descontinuado
+                    "media_type": "REELS",  # Tipo específico para reels
                     "video_url": body["video_url"],
                     "caption": caption,
                     "access_token": access_token
                 }
-
-            instagram_logger.debug(f"URL do container: {container_url}")
-            instagram_logger.debug(f"Dados do container: {json.dumps(container_data)}")
+            else:  # feed
+                container_data = {
+                    "media_type": "VIDEO",  # Tipo para vídeos no feed
+                    "video_url": body["video_url"],
+                    "caption": caption,
+                    "access_token": access_token
+                }
 
             # Se for agendado, adicionar timestamp
             if body["when"] == "schedule" and body.get("schedule_date"):
@@ -669,6 +668,9 @@ async def publish_to_instagram(
                 except ValueError as e:
                     instagram_logger.error(f"Data de agendamento inválida: {str(e)}")
                     raise HTTPException(status_code=400, detail=f"Data de agendamento inválida: {str(e)}")
+
+            instagram_logger.debug(f"URL do container: {container_url}")
+            instagram_logger.debug(f"Dados do container: {json.dumps(container_data)}")
 
             container_response = requests.post(container_url, data=container_data)
             instagram_logger.debug(f"Resposta da criação do container: {container_response.text}")
