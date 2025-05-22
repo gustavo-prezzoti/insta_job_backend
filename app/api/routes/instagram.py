@@ -7,8 +7,8 @@ from app.services.instagram import (
 )
 # Import the new publish function from instagram_graph
 from app.services.instagram_graph import publish_to_instagram as graph_publish_to_instagram
-from app.services.auth import get_user_from_db, get_current_user
-from app.core.security import verify_jwt, get_user_id_from_token
+from app.services.auth import get_user_from_db
+from app.core.security import verify_jwt, get_user_id_from_token, get_current_user
 from instagrapi import Client
 from app.utils.proxy import get_user_proxy_url
 from app.utils.serialization import serialize_session_data
