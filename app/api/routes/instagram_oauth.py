@@ -1821,9 +1821,9 @@ def upload_to_s3(file_path, bucket_name="zindex123", region="sa-east-1"):
         instagram_logger.error(f"Arquivo não encontrado: {file_path}")
         return None
     
-    # Credenciais da AWS (usar variáveis de ambiente em produção)
-    aws_access_key = "AKIAZ2K64GV7E757XR4G"
-    aws_secret_key = "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"
+    # Credenciais da AWS de variáveis de ambiente
+    aws_access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    aws_secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
     
     # Nome do arquivo no S3 (usando timestamp e nome original para evitar conflitos)
     filename = os.path.basename(file_path)
