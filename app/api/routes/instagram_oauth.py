@@ -773,7 +773,7 @@ async def publish_to_instagram(
                     instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
-                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir, is_tiktok)
                     
                     if converted_video_path and os.path.exists(converted_video_path):
                         instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
@@ -1571,13 +1571,14 @@ async def check_publishing_limit(
         instagram_logger.error(f"Erro ao verificar limite de publicação: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erro ao verificar limite de publicação: {str(e)}")
 
-def convert_video_for_instagram(input_path, output_dir=None):
+def convert_video_for_instagram(input_path, output_dir=None, is_tiktok=False):
     """
     Converte um vídeo para um formato compatível com o Instagram (MP4 com codec H.264).
     
     Args:
         input_path: Caminho do vídeo original
         output_dir: Diretório para salvar o vídeo convertido (opcional)
+        is_tiktok: Indica se o vídeo é do TikTok (tratamento especial)
         
     Returns:
         Path do vídeo convertido ou None se falhar
@@ -1658,24 +1659,59 @@ def convert_video_for_instagram(input_path, output_dir=None):
         _, probe_stderr = probe_process.communicate()
         instagram_logger.debug(f"Informações do vídeo original: {probe_stderr}")
         
+        # Verificar o tamanho do arquivo original
+        file_size_mb = os.path.getsize(input_path) / (1024 * 1024)
+        instagram_logger.debug(f"Tamanho do arquivo original: {file_size_mb:.2f} MB")
+        
         # Comando FFmpeg para converter para MP4 com codec H.264 compatível com Instagram
-        command = [
-            ffmpeg_path,
-            "-i", input_path,
-            "-c:v", "libx264",         # Codec de vídeo H.264
-            "-profile:v", "main",      # Perfil de vídeo (main é o mais compatível)
-            "-preset", "fast",         # Preset de codificação (equilibra velocidade e qualidade)
-            "-crf", "23",              # Qualidade do vídeo (menor = melhor)
-            "-c:a", "aac",             # Codec de áudio AAC
-            "-b:a", "128k",            # Bitrate do áudio
-            "-movflags", "+faststart", # Otimiza para streaming
-            "-pix_fmt", "yuv420p",     # Formato de pixel mais compatível
-            "-vf", "scale=720:1280",   # Dimensões fixas para Instagram (9:16)
-            "-r", "30",                # Framerate de 30fps (padrão para Instagram)
-            "-t", "60",                # Limitar duração a 60 segundos (para Stories)
-            "-y",                      # Sobrescrever se existir
-            output_path
-        ]
+        if is_tiktok:
+            # Tratamento especial para vídeos do TikTok - conversão em dois passos para maior compatibilidade
+            instagram_logger.info("Usando conversão especial para vídeo do TikTok")
+            
+            # Primeiro passo - extrair stream de vídeo
+            temp_output = os.path.join(output_dir, f"temp_{random_id}.mp4")
+            
+            # Primeiro comando: conversão mais rigorosa para garantir compatibilidade
+            command = [
+                ffmpeg_path,
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-profile:v", "baseline",  # Perfil mais compatível
+                "-level", "3.0",          # Nível de compatibilidade mais amplo
+                "-preset", "medium",      # Equilibra qualidade e velocidade
+                "-crf", "23",             # Qualidade razoável
+                "-maxrate", "2500k",      # Limitar bitrate máximo
+                "-bufsize", "5000k",      # Buffer para bitrate
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ac", "2",               # 2 canais de áudio
+                "-ar", "44100",           # Taxa de amostragem de áudio padrão
+                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                "-movflags", "+faststart",
+                "-metadata", "title=Instagram Video",
+                "-metadata", "author=ViralYX",
+                "-y",
+                output_path
+            ]
+        else:
+            # Conversão padrão para outros vídeos
+            command = [
+                ffmpeg_path,
+                "-i", input_path,
+                "-c:v", "libx264",         # Codec de vídeo H.264
+                "-profile:v", "main",      # Perfil de vídeo (main é o mais compatível)
+                "-preset", "fast",         # Preset de codificação (equilibra velocidade e qualidade)
+                "-crf", "23",              # Qualidade do vídeo (menor = melhor)
+                "-c:a", "aac",             # Codec de áudio AAC
+                "-b:a", "128k",            # Bitrate do áudio
+                "-movflags", "+faststart", # Otimiza para streaming
+                "-pix_fmt", "yuv420p",     # Formato de pixel mais compatível
+                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
+                "-r", "30",                # Framerate de 30fps (padrão para Instagram)
+                "-t", "60",                # Limitar duração a 60 segundos (para Stories)
+                "-y",                      # Sobrescrever se existir
+                output_path
+            ]
         
         instagram_logger.debug(f"Executando comando: {' '.join(command)}")
         
@@ -1693,18 +1729,25 @@ def convert_video_for_instagram(input_path, output_dir=None):
         if process.returncode != 0:
             instagram_logger.error(f"Erro na conversão: {stderr}")
             
-            # Tentar abordagem alternativa mais simples
+            # Tentar abordagem alternativa com parâmetros mais simples
             instagram_logger.info("Tentando método alternativo de conversão...")
             alt_command = [
                 ffmpeg_path,
                 "-i", input_path,
                 "-c:v", "libx264",
+                "-profile:v", "baseline",  # Mais compatível
+                "-level", "3.0",
                 "-c:a", "aac",
+                "-strict", "experimental",
+                "-b:a", "128k",
                 "-movflags", "+faststart",
                 "-pix_fmt", "yuv420p",
+                "-vf", "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
                 "-y",
                 output_path
             ]
+            
+            instagram_logger.debug(f"Executando comando alternativo: {' '.join(alt_command)}")
             
             alt_process = subprocess.Popen(
                 alt_command, 
@@ -1723,9 +1766,14 @@ def convert_video_for_instagram(input_path, output_dir=None):
                 simple_command = [
                     ffmpeg_path,
                     "-i", input_path,
+                    "-c:v", "libx264",
+                    "-c:a", "aac",
+                    "-pix_fmt", "yuv420p",
                     "-y",
                     output_path
                 ]
+                
+                instagram_logger.debug(f"Executando comando simples: {' '.join(simple_command)}")
                 
                 simple_process = subprocess.Popen(
                     simple_command, 
@@ -1742,7 +1790,44 @@ def convert_video_for_instagram(input_path, output_dir=None):
         
         # Verificar se o arquivo foi criado
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            instagram_logger.info(f"Vídeo convertido com sucesso: {output_path}")
+            output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            instagram_logger.info(f"Vídeo convertido com sucesso: {output_path} ({output_size_mb:.2f} MB)")
+            
+            # Verificar se o tamanho está dentro dos limites do Instagram (8MB para garantia)
+            if output_size_mb > 8:
+                instagram_logger.warning(f"Vídeo convertido muito grande ({output_size_mb:.2f} MB). Tentando compressão adicional...")
+                
+                # Compressão adicional para reduzir tamanho
+                compressed_output = os.path.join(output_dir, f"compressed_{random_id}.mp4")
+                
+                compress_command = [
+                    ffmpeg_path,
+                    "-i", output_path,
+                    "-c:v", "libx264",
+                    "-preset", "slow",  # Usar slow para melhor compressão
+                    "-crf", "28",       # Aumentar CRF para reduzir tamanho
+                    "-c:a", "aac",
+                    "-b:a", "96k",      # Reduzir bitrate de áudio
+                    "-y",
+                    compressed_output
+                ]
+                
+                compress_process = subprocess.Popen(
+                    compress_command, 
+                    stdout=subprocess.PIPE, 
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True
+                )
+                
+                compress_stdout, compress_stderr = compress_process.communicate()
+                
+                if compress_process.returncode == 0 and os.path.exists(compressed_output) and os.path.getsize(compressed_output) > 0:
+                    final_size_mb = os.path.getsize(compressed_output) / (1024 * 1024)
+                    instagram_logger.info(f"Compressão adicional bem-sucedida: {compressed_output} ({final_size_mb:.2f} MB)")
+                    
+                    # Usar o arquivo comprimido em vez do original
+                    return compressed_output
+            
             return output_path
         else:
             instagram_logger.error("Arquivo de saída não existe ou está vazio")
@@ -2025,7 +2110,7 @@ async def rate_limit_status(
                     instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
-                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir, is_tiktok)
                     
                     if converted_video_path and os.path.exists(converted_video_path):
                         instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
