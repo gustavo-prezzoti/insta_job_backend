@@ -773,7 +773,7 @@ async def publish_to_instagram(
                     instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
-                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir, is_tiktok)
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
                     
                     if converted_video_path and os.path.exists(converted_video_path):
                         instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
@@ -1570,7 +1570,6 @@ async def check_publishing_limit(
     except Exception as e:
         instagram_logger.error(f"Erro ao verificar limite de publicação: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Erro ao verificar limite de publicação: {str(e)}")
-
 def convert_video_for_instagram(input_path, output_dir=None, is_tiktok=False):
     """
     Converte um vídeo para um formato compatível com o Instagram (MP4 com codec H.264).
@@ -2119,7 +2118,7 @@ async def rate_limit_status(
                     instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
-                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir, is_tiktok)
+                    converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
                     
                     if converted_video_path and os.path.exists(converted_video_path):
                         instagram_logger.info(f"Vídeo convertido com sucesso: {converted_video_path}")
@@ -2605,7 +2604,8 @@ Para vídeos do TikTok, é recomendado baixar o vídeo e convertê-lo com um sof
 
         except Exception as e:
             instagram_logger.error(f"Erro inesperado: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")        finally:
+            raise HTTPException(status_code=500, detail=f"Erro inesperado: {str(e)}")
+        finally:
             # Garantir que o arquivo temporário seja removido
             try:
                 if 'video_path' in locals():
