@@ -730,6 +730,11 @@ async def publish_to_instagram(
                 # Criar arquivo temporário
                 import tempfile
                 temp_dir = tempfile.gettempdir()
+                
+                # Em ambientes de produção Linux/Ubuntu, usar um diretório mais adequado se possível
+                if os.name != 'nt' and os.access('/var/tmp', os.W_OK):
+                    temp_dir = '/var/tmp'  # Diretório mais adequado para arquivos temporários grandes no Linux
+                
                 video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
                 
                 # Salvar vídeo
@@ -750,8 +755,22 @@ async def publish_to_instagram(
                 instagram_logger.info("Convertendo vídeo para formato compatível com Instagram...")
                 try:
                     # Criar diretório temporário para vídeos convertidos
-                    temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted")
-                    os.makedirs(temp_converted_dir, exist_ok=True)
+                    temp_converted_dir = os.path.join(temp_dir, "instagram_converted")
+                    try:
+                        os.makedirs(temp_converted_dir, exist_ok=True)
+                        # Verificar se o diretório foi criado e tem permissões de escrita
+                        if not os.path.exists(temp_converted_dir) or not os.access(temp_converted_dir, os.W_OK):
+                            # Tentar diretório alternativo
+                            instagram_logger.warning(f"Diretório {temp_converted_dir} não tem permissões de escrita, usando alternativa")
+                            temp_converted_dir = os.path.join(tempfile.gettempdir(), f"instagram_conv_{uuid.uuid4().hex[:8]}")
+                            os.makedirs(temp_converted_dir, exist_ok=True)
+                    except Exception as dir_err:
+                        # Se falhar em criar o diretório, usar um alternativo
+                        instagram_logger.error(f"Erro ao criar diretório temporário: {str(dir_err)}")
+                        temp_converted_dir = os.path.join(tempfile.gettempdir(), f"instagram_conv_{uuid.uuid4().hex[:8]}")
+                        os.makedirs(temp_converted_dir, exist_ok=True)
+                    
+                    instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
                     converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
@@ -1597,6 +1616,27 @@ def convert_video_for_instagram(input_path, output_dir=None):
             if os.path.exists(path):
                 ffmpeg_path = path
                 break
+    else:
+        # Para sistemas Unix (Linux/Ubuntu/Mac)
+        possible_paths = [
+            "/usr/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",  # Para Mac com Homebrew
+            "ffmpeg"  # Se estiver no PATH
+        ]
+        
+        for path in possible_paths:
+            try:
+                # No Unix, podemos verificar se o comando existe com 'which'
+                result = subprocess.run(["which", path], capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    ffmpeg_path = result.stdout.strip()
+                    break
+            except:
+                # Se 'which' falhar, tentar verificar diretamente
+                if os.path.exists(path):
+                    ffmpeg_path = path
+                    break
     
     instagram_logger.debug(f"Usando FFmpeg em: {ffmpeg_path}")
     
@@ -1942,6 +1982,11 @@ async def rate_limit_status(
                 # Criar arquivo temporário
                 import tempfile
                 temp_dir = tempfile.gettempdir()
+                
+                # Em ambientes de produção Linux/Ubuntu, usar um diretório mais adequado se possível
+                if os.name != 'nt' and os.access('/var/tmp', os.W_OK):
+                    temp_dir = '/var/tmp'  # Diretório mais adequado para arquivos temporários grandes no Linux
+                
                 video_path = os.path.join(temp_dir, f"video_{user_id}_{int(datetime.now().timestamp())}.mp4")
                 
                 # Salvar vídeo
@@ -1962,8 +2007,22 @@ async def rate_limit_status(
                 instagram_logger.info("Convertendo vídeo para formato compatível com Instagram...")
                 try:
                     # Criar diretório temporário para vídeos convertidos
-                    temp_converted_dir = os.path.join(os.path.dirname(video_path), "instagram_converted")
-                    os.makedirs(temp_converted_dir, exist_ok=True)
+                    temp_converted_dir = os.path.join(temp_dir, "instagram_converted")
+                    try:
+                        os.makedirs(temp_converted_dir, exist_ok=True)
+                        # Verificar se o diretório foi criado e tem permissões de escrita
+                        if not os.path.exists(temp_converted_dir) or not os.access(temp_converted_dir, os.W_OK):
+                            # Tentar diretório alternativo
+                            instagram_logger.warning(f"Diretório {temp_converted_dir} não tem permissões de escrita, usando alternativa")
+                            temp_converted_dir = os.path.join(tempfile.gettempdir(), f"instagram_conv_{uuid.uuid4().hex[:8]}")
+                            os.makedirs(temp_converted_dir, exist_ok=True)
+                    except Exception as dir_err:
+                        # Se falhar em criar o diretório, usar um alternativo
+                        instagram_logger.error(f"Erro ao criar diretório temporário: {str(dir_err)}")
+                        temp_converted_dir = os.path.join(tempfile.gettempdir(), f"instagram_conv_{uuid.uuid4().hex[:8]}")
+                        os.makedirs(temp_converted_dir, exist_ok=True)
+                    
+                    instagram_logger.debug(f"Diretório temporário para conversão: {temp_converted_dir}")
                     
                     # Converter o vídeo
                     converted_video_path = convert_video_for_instagram(video_path, temp_converted_dir)
