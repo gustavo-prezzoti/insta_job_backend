@@ -364,12 +364,20 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
                         
                         # Revogar no Instagram/Meta
                         instagram_logger.info(f"Revogando token no Instagram/Meta para {username}")
+                        
+                        # Primeiro revogar o token
                         revoke_url = "https://graph.instagram.com/v18.0/instagram_oauth/revoke_access"
                         revoke_params = {
                             "access_token": access_token
                         }
                         revoke_response = requests.delete(revoke_url, params=revoke_params)
-                        instagram_logger.debug(f"Resposta da revogação no Instagram: {revoke_response.text}")
+                        instagram_logger.debug(f"Resposta da revogação do token no Instagram: {revoke_response.text}")
+                        
+                        # Depois revogar TODAS as permissões (desconecta completamente o app)
+                        # Esta é a chamada mais importante para desconectar o app
+                        disconnect_url = "https://graph.facebook.com/v18.0/me/permissions"
+                        disconnect_response = requests.delete(disconnect_url, params=revoke_params)
+                        instagram_logger.debug(f"Resposta da revogação de permissões: {disconnect_response.text}")
                         
                         # Também tentar desconectar app no Facebook
                         app_id = os.environ.get("INSTAGRAM_APP_ID") or os.environ.get("FACEBOOK_APP_ID")
@@ -426,12 +434,20 @@ async def revoke_instagram_access(request: Request, body: dict = None, jwt_token
                             
                             # Revogar no Instagram/Meta
                             instagram_logger.info(f"Revogando token no Instagram/Meta para {username}")
+                            
+                            # Primeiro revogar o token
                             revoke_url = "https://graph.instagram.com/v18.0/instagram_oauth/revoke_access"
                             revoke_params = {
                                 "access_token": access_token
                             }
                             revoke_response = requests.delete(revoke_url, params=revoke_params)
-                            instagram_logger.debug(f"Resposta da revogação no Instagram: {revoke_response.text}")
+                            instagram_logger.debug(f"Resposta da revogação do token no Instagram: {revoke_response.text}")
+                            
+                            # Depois revogar TODAS as permissões (desconecta completamente o app)
+                            # Esta é a chamada mais importante para desconectar o app
+                            disconnect_url = "https://graph.facebook.com/v18.0/me/permissions"
+                            disconnect_response = requests.delete(disconnect_url, params=revoke_params)
+                            instagram_logger.debug(f"Resposta da revogação de permissões: {disconnect_response.text}")
                             
                             # Também tentar desconectar app no Facebook
                             app_id = os.environ.get("INSTAGRAM_APP_ID") or os.environ.get("FACEBOOK_APP_ID")
